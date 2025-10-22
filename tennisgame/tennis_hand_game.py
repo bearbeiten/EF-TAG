@@ -20,6 +20,13 @@ class Ball:
         self.damping = 0.98
         self.bounce_damping = 0.7
         self.center_line = None  # Will be set to cam_width for reference
+        
+        # For client-side interpolation
+        self.target_x = x
+        self.target_y = y
+        self.target_vx = 0
+        self.target_vy = 0
+        self.interpolation_speed = 0.3  # Higher = faster catch-up
     
     def update(self, width, height, floor_height=100):
         # Apply gravity
@@ -71,11 +78,31 @@ class Ball:
             'vy': self.vy
         }
     
-    def from_dict(self, data):
-        self.x = data['x']
-        self.y = data['y']
-        self.vx = data['vx']
-        self.vy = data['vy']
+    def from_dict(self, data, interpolate=False):
+        """Update ball state from network data"""
+        if interpolate:
+            # Set targets for interpolation
+            self.target_x = data['x']
+            self.target_y = data['y']
+            self.target_vx = data['vx']
+            self.target_vy = data['vy']
+        else:
+            # Direct update (for host)
+            self.x = data['x']
+            self.y = data['y']
+            self.vx = data['vx']
+            self.vy = data['vy']
+            self.target_x = self.x
+            self.target_y = self.y
+            self.target_vx = self.vx
+            self.target_vy = self.vy
+    
+    def interpolate_to_target(self):
+        """Smoothly interpolate position towards target (for clients)"""
+        self.x += (self.target_x - self.x) * self.interpolation_speed
+        self.y += (self.target_y - self.y) * self.interpolation_speed
+        self.vx += (self.target_vx - self.vx) * self.interpolation_speed
+        self.vy += (self.target_vy - self.vy) * self.interpolation_speed
 
 class Hand:
     def __init__(self, radius=50):
@@ -155,6 +182,12 @@ class NetworkManager:
         
         self.running = True
         self.receive_thread = None
+        
+        # Network throttling
+        self.last_send_time = 0
+        self.send_interval = 1.0 / 30.0  # Send at most 30 times per second
+        self.last_hand_send_time = 0
+        self.hand_send_interval = 1.0 / 60.0  # Send hand updates more frequently
     
     def start_server(self):
         """Start TCP server and wait for connection"""
@@ -196,6 +229,9 @@ class NetworkManager:
                         self.connection = conn
                         self.client_address = addr
                         self.is_left_player = (data['position'] == 'right')
+                        
+                        # Optimize socket for low latency
+                        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         
                         # Send acceptance
                         position = 'left' if self.is_left_player else 'right'
@@ -241,6 +277,10 @@ class NetworkManager:
             if response and response['type'] == 'handshake_accept':
                 self.connection = self.client_socket
                 self.connected = True
+                
+                # Optimize socket for low latency
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                
                 print(f"Connected! Peer is: {response['position']}")
                 
                 # Start receive thread
@@ -271,17 +311,26 @@ class NetworkManager:
             
             message_length = int.from_bytes(length_data, 'big')
             
+            # Sanity check message length
+            if message_length > 1000000:  # 1MB limit
+                print(f"Message too large: {message_length}")
+                return None
+            
             # Receive the actual message
             message_data = b''
             while len(message_data) < message_length:
-                chunk = sock.recv(message_length - len(message_data))
+                chunk = sock.recv(min(8192, message_length - len(message_data)))
                 if not chunk:
                     return None
                 message_data += chunk
             
             return json.loads(message_data.decode('utf-8'))
+        except socket.timeout:
+            return None
         except Exception as e:
-            print(f"Receive error: {e}")
+            # Only log unexpected errors
+            if self.running and self.connected:
+                print(f"Receive error: {e}")
             return None
     
     def _send_message(self, message, sock=None):
@@ -302,13 +351,16 @@ class NetworkManager:
     
     def _receive_loop(self):
         """Main receive loop for handling messages"""
+        # Set socket to non-blocking mode with timeout
+        if self.connection:
+            self.connection.settimeout(0.1)  # 100ms timeout
+        
         while self.running and self.connected:
             try:
                 message = self._recv_message(self.connection)
                 if message is None:
-                    print("Connection closed by peer")
-                    self.connected = False
-                    break
+                    # Timeout or connection closed
+                    continue
                 
                 if message['type'] == 'game_state':
                     self.received_data = message
@@ -316,6 +368,9 @@ class NetworkManager:
                 elif message['type'] == 'ping':
                     self._send_message({'type': 'pong'})
                     
+            except socket.timeout:
+                # Normal timeout, continue
+                continue
             except Exception as e:
                 if self.running:
                     print(f"Receive loop error: {e}")
@@ -323,20 +378,39 @@ class NetworkManager:
                 break
     
     def send_game_state(self, ball, hand, score, has_authority, is_host, authority_reset=False, display_width=None):
-        """Send complete game state to peer"""
-        if self.connected:
-            message = {
-                'type': 'game_state',
-                'ball': ball.to_dict(),
-                'hand': hand.to_dict(),
-                'score': score,
-                'has_authority': has_authority,
-                'is_host': is_host,
-                'authority_reset': authority_reset
-            }
-            if display_width is not None:
-                message['display_width'] = display_width
-            self._send_message(message)
+        """Send complete game state to peer with throttling"""
+        if not self.connected:
+            return
+        
+        current_time = time.time()
+        
+        # Throttle game state sends (host sends ball state)
+        if is_host and (current_time - self.last_send_time) < self.send_interval:
+            return
+        
+        # For clients, only send hand updates at higher frequency
+        if not is_host and (current_time - self.last_hand_send_time) < self.hand_send_interval:
+            return
+        
+        message = {
+            'type': 'game_state',
+            'ball': ball.to_dict() if is_host else None,  # Only host sends ball
+            'hand': hand.to_dict(),
+            'score': score if is_host else None,  # Only host sends score
+            'has_authority': has_authority,
+            'is_host': is_host,
+            'authority_reset': authority_reset,
+            'timestamp': current_time
+        }
+        if display_width is not None:
+            message['display_width'] = display_width
+        
+        self._send_message(message)
+        
+        if is_host:
+            self.last_send_time = current_time
+        else:
+            self.last_hand_send_time = current_time
     
     def get_received_data(self):
         """Get received game state"""
@@ -548,18 +622,22 @@ def main():
         
         if peer_data:
             # Always update peer hand
-            if 'hand' in peer_data:
+            if 'hand' in peer_data and peer_data['hand'] is not None:
                 peer_hand.from_dict(peer_data['hand'])
             
             # If we receive data from the host, trust their ball state and score
             if peer_data.get('is_host', False):
-                if 'score' in peer_data:
+                if 'score' in peer_data and peer_data['score'] is not None:
                     score = peer_data['score']
-                if 'ball' in peer_data:
+                if 'ball' in peer_data and peer_data['ball'] is not None:
                     # Host sends ball in full double-width coordinate system
-                    # We just use it directly since we render to the same double-width canvas
-                    ball.from_dict(peer_data['ball'])
-                    prev_ball_x = ball.x
+                    # Use interpolation for smooth rendering on client
+                    ball.from_dict(peer_data['ball'], interpolate=(not is_host))
+                    if not is_host:
+                        # For clients, just set the target
+                        pass
+                    else:
+                        prev_ball_x = ball.x
                     last_interaction_time = time.time()
         
         # Host decides authority and simulates physics; clients only render
@@ -584,7 +662,7 @@ def main():
             last_interaction_time = time.time()
             print("HOST TIMEOUT RESET - Ball respawned")
         
-        # Only host simulates physics and updates score
+        # Host simulates physics, client interpolates
         if is_host:
             # Check collision with my hand
             if my_hand.check_collision(ball):
@@ -624,8 +702,11 @@ def main():
                 
                 last_interaction_time = time.time()
             
-            # Update ball physics
+            # Update ball physics (host only)
             ball.update(display_width, display_height, floor_height)
+        else:
+            # Client: interpolate to received position
+            ball.interpolate_to_target()
             
             # Update score (host only)
             if ball.x - ball.radius <= 0:
