@@ -70,7 +70,7 @@ class Ball:
         self.gravity = 0.5
         self.damping = 0.98
         self.bounce_damping = 0.7
-        self.max_speed = 25  # Maximum speed in pixels per frame
+        self.max_speed = 50  # Maximum speed in pixels per frame
     
     def update(self, width, height, floor_height=100):
         # Apply gravity
@@ -138,15 +138,22 @@ class Hand:
     def __init__(self, radius=50):
         self.x = None
         self.y = None
-        # Smoothed/drawn position
+        # Target position (from detection/network)
+        self.target_x = None
+        self.target_y = None
+        # Smoothed/drawn position (interpolated)
         self.display_x = None
         self.display_y = None
         self.radius = radius
         self.is_active = False
         self.last_seen_time = 0
         self.timeout = 0.5  # seconds before hand disappears
+        
+        # Linear interpolation settings for smooth catch-up
+        self.lerp_speed = 0.35  # Smoothness factor (0-1), higher = faster catch-up
+        self.max_lerp_distance = 300  # Max pixels per frame to catch up (prevents extreme jumps)
 
-        # One Euro filters for low-latency smoothing
+        # One Euro filters for low-latency smoothing on the target position
         # Tune min_cutoff/beta to trade jitter vs. responsiveness
         self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0)
         self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0)
@@ -163,11 +170,13 @@ class Hand:
 
         # If this is the first-ever sample, or we have no display pos yet, snap once.
         if self.display_x is None or self.display_y is None:
+            self.target_x = center_x
+            self.target_y = center_y
             self.display_x = center_x
             self.display_y = center_y
             # Re-init filters from this starting point
-            self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_x, init_time=now)
-            self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_y, init_time=now)
+            self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.target_x, init_time=now)
+            self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.target_y, init_time=now)
             return
 
         # If we just re-acquired the hand after a timeout, start smoothing from last drawn pos
@@ -175,9 +184,38 @@ class Hand:
             self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_x, init_time=now)
             self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_y, init_time=now)
 
-        # Smoothly chase the new measured position
-        self.display_x = self._filter_x.apply(center_x, now)
-        self.display_y = self._filter_y.apply(center_y, now)
+        # Apply filter to get target position (filtered version of raw input)
+        self.target_x = self._filter_x.apply(center_x, now)
+        self.target_y = self._filter_y.apply(center_y, now)
+
+    def update_display_position(self):
+        """Linearly interpolate display position towards target to avoid teleporting."""
+        if self.target_x is None or self.target_y is None:
+            return
+        
+        if self.display_x is None or self.display_y is None:
+            self.display_x = self.target_x
+            self.display_y = self.target_y
+            return
+        
+        # Calculate distance to target
+        dx = self.target_x - self.display_x
+        dy = self.target_y - self.display_y
+        distance = np.sqrt(dx**2 + dy**2)
+        
+        if distance < 0.5:  # Close enough, snap to target
+            self.display_x = self.target_x
+            self.display_y = self.target_y
+        else:
+            # Linear interpolation towards target
+            # Use lerp_speed but cap the maximum distance per frame
+            lerp_distance = min(distance * self.lerp_speed, self.max_lerp_distance)
+            
+            # Move display position towards target
+            if distance > 0:
+                move_ratio = lerp_distance / distance
+                self.display_x += dx * move_ratio
+                self.display_y += dy * move_ratio
 
     def check_timeout(self):
         """Check if hand should disappear due to timeout"""
@@ -204,21 +242,35 @@ class Hand:
         return distance < (self.radius + ball.radius)
 
     def to_dict(self):
-        # Share the smoothed/drawn position over the network
+        # Share the target position over the network (the filtered input position)
         return {
-            'x': self.display_x,
-            'y': self.display_y,
+            'x': self.target_x,
+            'y': self.target_y,
             'is_active': self.is_active
         }
 
     def from_dict(self, data):
-        # For peer hands, use the position as-is without additional smoothing here
+        # For peer hands, set the target position and let it interpolate
         if data:
-            self.display_x = data.get('x')
-            self.display_y = data.get('y')
-            self.x = self.display_x
-            self.y = self.display_y
+            new_x = data.get('x')
+            new_y = data.get('y')
             self.is_active = data.get('is_active', False)
+            
+            if new_x is not None and new_y is not None:
+                # Initialize if first time
+                if self.target_x is None or self.target_y is None:
+                    self.target_x = new_x
+                    self.target_y = new_y
+                    self.display_x = new_x
+                    self.display_y = new_y
+                else:
+                    # Update target position (will be interpolated in update_display_position)
+                    self.target_x = new_x
+                    self.target_y = new_y
+                
+                self.x = self.target_x
+                self.y = self.target_y
+                
             if self.is_active:
                 self.last_seen_time = time.time()
 
@@ -733,6 +785,10 @@ def main():
 
         # Check hand timeout
         my_hand.check_timeout()
+        
+        # Update hand display positions (smooth interpolation towards target)
+        my_hand.update_display_position()
+        peer_hand.update_display_position()
         
         # Calculate hand velocity (based on smoothed positions)
         hand_vx, hand_vy = 0, 0
