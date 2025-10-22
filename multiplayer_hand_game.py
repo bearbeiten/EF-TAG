@@ -20,7 +20,7 @@ class Ball:
         self.damping = 0.98
         self.bounce_damping = 0.7
     
-    def update(self, width, height, is_left_player):
+    def update(self, width, height, is_left_player, floor_height=100):
         # Apply gravity
         self.vy += self.gravity
         
@@ -44,14 +44,19 @@ class Ball:
                 self.x = width - self.radius
                 self.vx = -self.vx * self.bounce_damping
         
-        # Top and bottom walls
+        # Top wall
         if self.y - self.radius < 0:
             self.y = self.radius
             self.vy = -self.vy * self.bounce_damping
-        elif self.y + self.radius > height:
-            self.y = height - self.radius
+        
+        # Floor collision (raised floor)
+        floor_y = height - floor_height
+        if self.y + self.radius > floor_y:
+            self.y = floor_y - self.radius
             self.vy = -self.vy * self.bounce_damping
-    
+            # Add friction when on ground
+            self.vx *= 0.95
+
     def apply_force(self, fx, fy):
         self.vx += fx
         self.vy += fy
@@ -73,6 +78,51 @@ class Ball:
         self.y = data['y']
         self.vx = data['vx']
         self.vy = data['vy']
+
+class Hand:
+    def __init__(self, radius=50):
+        self.x = None
+        self.y = None
+        self.radius = radius
+        self.is_active = False
+        self.last_seen_time = 0
+        self.timeout = 0.5  # seconds before hand disappears
+    
+    def update(self, center_x, center_y):
+        """Update hand position when detected"""
+        self.x = center_x
+        self.y = center_y
+        self.is_active = True
+        self.last_seen_time = time.time()
+    
+    def check_timeout(self):
+        """Check if hand should disappear due to timeout"""
+        if self.is_active and (time.time() - self.last_seen_time) > self.timeout:
+            self.is_active = False
+    
+    def draw(self, frame):
+        """Draw the hand circle"""
+        if self.is_active and self.x is not None and self.y is not None:
+            # Draw semi-transparent filled circle
+            overlay = frame.copy()
+            cv2.circle(overlay, (int(self.x), int(self.y)), self.radius, (0, 255, 0), -1)
+            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+            
+            # Draw outline
+            cv2.circle(frame, (int(self.x), int(self.y)), self.radius, (0, 255, 0), 3)
+            
+            # Draw center point
+            cv2.circle(frame, (int(self.x), int(self.y)), 5, (255, 0, 0), -1)
+    
+    def check_collision(self, ball):
+        """Check if hand collides with ball"""
+        if not self.is_active or self.x is None or self.y is None:
+            return False
+        
+        dx = self.x - ball.x
+        dy = self.y - ball.y
+        distance = np.sqrt(dx**2 + dy**2)
+        return distance < (self.radius + ball.radius)
 
 class NetworkManager:
     def __init__(self, port=5555):
@@ -425,11 +475,17 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
+    # Floor settings
+    floor_height = 100
+    
     # Initialize ball
     if is_left_player:
         ball = Ball(width // 4, height // 2)
     else:
         ball = Ball(3 * width // 4, height // 2)
+    
+    # Initialize hand
+    hand = Hand(radius=50)
     
     has_ball = True
     score = {'left': 0, 'right': 0}
@@ -449,6 +505,11 @@ def main():
         
         frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Draw floor
+        floor_y = height - floor_height
+        cv2.rectangle(frame, (0, floor_y), (width, height), (139, 69, 19), -1)
+        cv2.line(frame, (0, floor_y), (width, floor_y), (100, 50, 0), 3)
         
         # Draw dividing line
         line_color = (0, 255, 0) if network.connected else (0, 0, 255)
@@ -480,28 +541,31 @@ def main():
         # Process hand detection
         results = hands.process(rgb_frame)
         
-        hand_polygon = None
-        hand_center_x, hand_center_y = None, None
+        hand_detected = False
         
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
+                # Draw hand landmarks (optional, can be removed for cleaner look)
                 mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(0, 150, 0), thickness=1, circle_radius=1),
+                    mp_drawing.DrawingSpec(color=(0, 200, 0), thickness=1))
                 
                 hand_polygon = get_hand_polygon(hand_landmarks, width, height)
                 
-                overlay = frame.copy()
-                cv2.fillPoly(overlay, [hand_polygon], (0, 255, 0))
-                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-                cv2.polylines(frame, [hand_polygon], True, (0, 255, 0), 2)
-                
+                # Calculate hand center (centroid of polygon)
                 M = cv2.moments(hand_polygon)
                 if M["m00"] != 0:
                     hand_center_x = int(M["m10"] / M["m00"])
                     hand_center_y = int(M["m01"] / M["m00"])
                     
-                    cv2.circle(frame, (hand_center_x, hand_center_y), 10, (255, 0, 0), -1)
+                    # Update hand position
+                    hand.update(hand_center_x, hand_center_y)
                     hand_positions.append((hand_center_x, hand_center_y))
+                    hand_detected = True
+        
+        # Check hand timeout
+        hand.check_timeout()
         
         # Calculate hand velocity
         hand_vx, hand_vy = 0, 0
@@ -511,27 +575,29 @@ def main():
         
         # Handle ball physics and collision only if we have the ball
         if has_ball:
-            if hand_polygon is not None:
-                collision, _, _ = check_collision_with_polygon(ball, hand_polygon)
+            # Check collision with hand circle
+            if hand.check_collision(ball):
+                dx = ball.x - hand.x
+                dy = ball.y - hand.y
+                dist = np.sqrt(dx**2 + dy**2)
                 
-                if collision and hand_center_x is not None:
-                    dx = ball.x - hand_center_x
-                    dy = ball.y - hand_center_y
-                    dist = np.sqrt(dx**2 + dy**2)
+                if dist > 0:
+                    dx /= dist
+                    dy /= dist
                     
-                    if dist > 0:
-                        dx /= dist
-                        dy /= dist
-                        
-                        impulse_strength = 2.0
-                        ball.apply_force(hand_vx * impulse_strength + dx * 5, 
-                                       hand_vy * impulse_strength + dy * 5)
-                        ball.x += dx * 3
-                        ball.y += dy * 3
+                    impulse_strength = 2.0
+                    ball.apply_force(hand_vx * impulse_strength + dx * 5, 
+                                   hand_vy * impulse_strength + dy * 5)
                     
-                    cv2.circle(frame, (int(ball.x), int(ball.y)), ball.radius + 5, (0, 0, 255), 3)
+                    # Push ball out of hand
+                    overlap = (hand.radius + ball.radius) - dist
+                    ball.x += dx * (overlap + 3)
+                    ball.y += dy * (overlap + 3)
+                
+                # Visual feedback
+                cv2.circle(frame, (int(ball.x), int(ball.y)), ball.radius + 5, (0, 0, 255), 3)
             
-            ball.update(width, height, is_left_player)
+            ball.update(width, height, is_left_player, floor_height)
             
             # Check if ball crossed to other side
             if is_left_player and ball.x > width - 50:
@@ -554,6 +620,9 @@ def main():
                     ball.vx = abs(ball.vx)
             
             ball.draw(frame)
+        
+        # Draw hand (fixed circle)
+        hand.draw(frame)
         
         # Draw UI
         mode_text = "SERVER" if is_host else "CLIENT"
