@@ -20,7 +20,7 @@ class Ball:
         self.damping = 0.98
         self.bounce_damping = 0.7
     
-    def update(self, width, height, is_left_player, floor_height=100):
+    def update(self, width, height, floor_height=100):
         # Apply gravity
         self.vy += self.gravity
         
@@ -32,17 +32,13 @@ class Ball:
         self.x += self.vx
         self.y += self.vy
         
-        # Wall collisions (left/right handled differently for multiplayer)
-        if is_left_player:
-            # Left player - only bounce on left side
-            if self.x - self.radius < 0:
-                self.x = self.radius
-                self.vx = -self.vx * self.bounce_damping
-        else:
-            # Right player - only bounce on right side
-            if self.x + self.radius > width:
-                self.x = width - self.radius
-                self.vx = -self.vx * self.bounce_damping
+        # Wall collisions (both sides)
+        if self.x - self.radius < 0:
+            self.x = self.radius
+            self.vx = -self.vx * self.bounce_damping
+        elif self.x + self.radius > width:
+            self.x = width - self.radius
+            self.vx = -self.vx * self.bounce_damping
         
         # Top wall
         if self.y - self.radius < 0:
@@ -56,7 +52,7 @@ class Ball:
             self.vy = -self.vy * self.bounce_damping
             # Add friction when on ground
             self.vx *= 0.95
-
+    
     def apply_force(self, fx, fy):
         self.vx += fx
         self.vy += fy
@@ -123,6 +119,21 @@ class Hand:
         dy = self.y - ball.y
         distance = np.sqrt(dx**2 + dy**2)
         return distance < (self.radius + ball.radius)
+    
+    def to_dict(self):
+        return {
+            'x': self.x,
+            'y': self.y,
+            'is_active': self.is_active
+        }
+    
+    def from_dict(self, data):
+        if data:
+            self.x = data.get('x')
+            self.y = data.get('y')
+            self.is_active = data.get('is_active', False)
+            if self.is_active:
+                self.last_seen_time = time.time()
 
 class NetworkManager:
     def __init__(self, port=5555):
@@ -136,7 +147,7 @@ class NetworkManager:
         self.connected = False
         self.is_left_player = True
         
-        self.received_ball = None
+        self.received_data = None
         self.last_receive_time = 0
         
         self.running = True
@@ -296,8 +307,8 @@ class NetworkManager:
                     self.connected = False
                     break
                 
-                if message['type'] == 'ball_transfer':
-                    self.received_ball = message['ball']
+                if message['type'] == 'game_state':
+                    self.received_data = message
                     self.last_receive_time = time.time()
                 elif message['type'] == 'ping':
                     self._send_message({'type': 'pong'})
@@ -308,19 +319,19 @@ class NetworkManager:
                 self.connected = False
                 break
     
-    def send_ball(self, ball):
-        """Send ball to peer"""
+    def send_game_state(self, ball, hand, score):
+        """Send complete game state to peer"""
         if self.connected:
             self._send_message({
-                'type': 'ball_transfer',
-                'ball': ball.to_dict()
+                'type': 'game_state',
+                'ball': ball.to_dict(),
+                'hand': hand.to_dict(),
+                'score': score
             })
     
-    def get_received_ball(self):
-        """Get received ball data"""
-        ball = self.received_ball
-        self.received_ball = None
-        return ball
+    def get_received_data(self):
+        """Get received game state"""
+        return self.received_data
     
     def close(self):
         """Close all connections"""
@@ -354,57 +365,6 @@ def get_hand_polygon(hand_landmarks, width, height):
     points = np.array(points, dtype=np.int32)
     hull = cv2.convexHull(points)
     return hull
-
-def check_collision_with_polygon(ball, hand_polygon):
-    if hand_polygon is None or len(hand_polygon) == 0:
-        return False, None, None
-    
-    ball_center = (int(ball.x), int(ball.y))
-    dist = cv2.pointPolygonTest(hand_polygon, ball_center, True)
-    
-    if dist > -ball.radius:
-        min_dist = float('inf')
-        closest_point = None
-        
-        for i in range(len(hand_polygon)):
-            p1 = hand_polygon[i][0]
-            p2 = hand_polygon[(i + 1) % len(hand_polygon)][0]
-            
-            line_dist = point_to_segment_distance(ball_center, p1, p2)
-            if line_dist < min_dist:
-                min_dist = line_dist
-                closest_point = closest_point_on_segment(ball_center, p1, p2)
-        
-        return True, closest_point, dist
-    
-    return False, None, None
-
-def point_to_segment_distance(point, seg_a, seg_b):
-    px, py = point
-    ax, ay = seg_a
-    bx, by = seg_b
-    
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return np.sqrt((px - ax)**2 + (py - ay)**2)
-    
-    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx**2 + dy**2)))
-    proj_x = ax + t * dx
-    proj_y = ay + t * dy
-    
-    return np.sqrt((px - proj_x)**2 + (py - proj_y)**2)
-
-def closest_point_on_segment(point, seg_a, seg_b):
-    px, py = point
-    ax, ay = seg_a
-    bx, by = seg_b
-    
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return seg_a
-    
-    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx**2 + dy**2)))
-    return (int(ax + t * dx), int(ay + t * dy))
 
 def setup_connection():
     root = tk.Tk()
@@ -472,30 +432,31 @@ def main():
     
     # Initialize webcam
     cap = cv2.VideoCapture(0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cam_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cam_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Display dimensions (double width for split screen)
+    display_width = cam_width * 2
+    display_height = cam_height
     
     # Floor settings
     floor_height = 100
     
-    # Initialize ball
-    if is_left_player:
-        ball = Ball(width // 4, height // 2)
-    else:
-        ball = Ball(3 * width // 4, height // 2)
+    # Initialize ball (shared position in full display space)
+    ball = Ball(display_width // 2, display_height // 2)
     
-    # Initialize hand
-    hand = Hand(radius=50)
+    # Initialize hands
+    my_hand = Hand(radius=50)
+    peer_hand = Hand(radius=50)
     
-    has_ball = True
     score = {'left': 0, 'right': 0}
     
     hand_positions = deque(maxlen=5)
     
-    print("\n=== MULTIPLAYER HAND BALL GAME (TCP) ===")
+    print("\n=== MULTIPLAYER HAND BALL GAME (SPLIT SCREEN) ===")
     print(f"You are: {'LEFT' if is_left_player else 'RIGHT'} player")
     print(f"Mode: {'SERVER' if is_host else 'CLIENT'}")
-    print("Send the ball to the other side to score!")
+    print("Hit the ball to the opponent's side!")
     print("Press 'q' to quit")
     
     while cap.isOpened():
@@ -506,66 +467,51 @@ def main():
         frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Draw floor
-        floor_y = height - floor_height
-        cv2.rectangle(frame, (0, floor_y), (width, height), (139, 69, 19), -1)
-        cv2.line(frame, (0, floor_y), (width, floor_y), (100, 50, 0), 3)
+        # Create double-width canvas
+        canvas = np.zeros((display_height, display_width, 3), dtype=np.uint8)
         
-        # Draw dividing line
-        line_color = (0, 255, 0) if network.connected else (0, 0, 255)
+        # Draw floor on full canvas
+        floor_y = display_height - floor_height
+        cv2.rectangle(canvas, (0, floor_y), (display_width, display_height), (139, 69, 19), -1)
+        cv2.line(canvas, (0, floor_y), (display_width, floor_y), (100, 50, 0), 3)
+        
+        # Place camera feed on appropriate side
         if is_left_player:
-            cv2.line(frame, (width - 50, 0), (width - 50, height), line_color, 3)
-            cv2.putText(frame, "SEND -->", (width - 140, height // 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, line_color, 2)
+            canvas[0:cam_height, 0:cam_width] = frame
         else:
-            cv2.line(frame, (50, 0), (50, height), line_color, 3)
-            cv2.putText(frame, "<-- SEND", (60, height // 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, line_color, 2)
+            canvas[0:cam_height, cam_width:display_width] = frame
         
-        # Check for received ball
-        received_ball_data = network.get_received_ball()
-        if received_ball_data and not has_ball:
-            ball.from_dict(received_ball_data)
-            # Flip ball position and velocity for opposite screen
-            if is_left_player:
-                # Ball coming from right side - should enter from right
-                ball.x = width - 100
-                ball.vx = -abs(ball.vx)  # Force leftward velocity
-            else:
-                # Ball coming from left side - should enter from left
-                ball.x = 100
-                ball.vx = abs(ball.vx)  # Force rightward velocity
-            has_ball = True
-            print("Ball received!")
+        # Draw center dividing line
+        cv2.line(canvas, (cam_width, 0), (cam_width, display_height), (255, 255, 255), 4)
+        cv2.putText(canvas, "LEFT", (cam_width - 80, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(canvas, "RIGHT", (cam_width + 20, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
         # Process hand detection
         results = hands.process(rgb_frame)
         
-        hand_detected = False
-        
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                # Draw hand landmarks (optional, can be removed for cleaner look)
-                mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(0, 150, 0), thickness=1, circle_radius=1),
-                    mp_drawing.DrawingSpec(color=(0, 200, 0), thickness=1))
+                hand_polygon = get_hand_polygon(hand_landmarks, cam_width, cam_height)
                 
-                hand_polygon = get_hand_polygon(hand_landmarks, width, height)
-                
-                # Calculate hand center (centroid of polygon)
+                # Calculate hand center
                 M = cv2.moments(hand_polygon)
                 if M["m00"] != 0:
                     hand_center_x = int(M["m10"] / M["m00"])
                     hand_center_y = int(M["m01"] / M["m00"])
                     
-                    # Update hand position
-                    hand.update(hand_center_x, hand_center_y)
-                    hand_positions.append((hand_center_x, hand_center_y))
-                    hand_detected = True
+                    # Offset to full canvas position
+                    if is_left_player:
+                        canvas_x = hand_center_x
+                    else:
+                        canvas_x = cam_width + hand_center_x
+                    
+                    my_hand.update(canvas_x, hand_center_y)
+                    hand_positions.append((canvas_x, hand_center_y))
         
         # Check hand timeout
-        hand.check_timeout()
+        my_hand.check_timeout()
         
         # Calculate hand velocity
         hand_vx, hand_vy = 0, 0
@@ -573,81 +519,88 @@ def main():
             hand_vx = (hand_positions[-1][0] - hand_positions[0][0]) / len(hand_positions)
             hand_vy = (hand_positions[-1][1] - hand_positions[0][1]) / len(hand_positions)
         
-        # Handle ball physics and collision only if we have the ball
-        if has_ball:
-            # Check collision with hand circle
-            if hand.check_collision(ball):
-                dx = ball.x - hand.x
-                dy = ball.y - hand.y
-                dist = np.sqrt(dx**2 + dy**2)
-                
-                if dist > 0:
-                    dx /= dist
-                    dy /= dist
-                    
-                    impulse_strength = 2.0
-                    ball.apply_force(hand_vx * impulse_strength + dx * 5, 
-                                   hand_vy * impulse_strength + dy * 5)
-                    
-                    # Push ball out of hand
-                    overlap = (hand.radius + ball.radius) - dist
-                    ball.x += dx * (overlap + 3)
-                    ball.y += dy * (overlap + 3)
-                
-                # Visual feedback
-                cv2.circle(frame, (int(ball.x), int(ball.y)), ball.radius + 5, (0, 0, 255), 3)
+        # Get peer data
+        peer_data = network.get_received_data()
+        if peer_data:
+            # Update peer hand
+            if 'hand' in peer_data:
+                peer_hand.from_dict(peer_data['hand'])
             
-            ball.update(width, height, is_left_player, floor_height)
-            
-            # Check if ball crossed to other side
-            if is_left_player and ball.x > width - 50:
-                if network.connected:
-                    network.send_ball(ball)
-                    has_ball = False
-                    score['left'] += 1
-                    print("Ball sent to opponent!")
-                else:
-                    ball.x = width - 50
-                    ball.vx = -abs(ball.vx)
-            elif not is_left_player and ball.x < 50:
-                if network.connected:
-                    network.send_ball(ball)
-                    has_ball = False
-                    score['right'] += 1
-                    print("Ball sent to opponent!")
-                else:
-                    ball.x = 50
-                    ball.vx = abs(ball.vx)
-            
-            ball.draw(frame)
+            # Sync score
+            if 'score' in peer_data:
+                score = peer_data['score']
         
-        # Draw hand (fixed circle)
-        hand.draw(frame)
+        # Check collision with my hand
+        if my_hand.check_collision(ball):
+            dx = ball.x - my_hand.x
+            dy = ball.y - my_hand.y
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            if dist > 0:
+                dx /= dist
+                dy /= dist
+                
+                impulse_strength = 2.0
+                ball.apply_force(hand_vx * impulse_strength + dx * 5, 
+                               hand_vy * impulse_strength + dy * 5)
+                
+                # Push ball out of hand
+                overlap = (my_hand.radius + ball.radius) - dist
+                ball.x += dx * (overlap + 3)
+                ball.y += dy * (overlap + 3)
+        
+        # Update ball physics
+        ball.update(display_width, display_height, floor_height)
+        
+        # Check scoring (ball touches opponent's edge)
+        if ball.x - ball.radius <= 0:
+            # Ball touched left edge - right player scores
+            score['right'] += 1
+            ball.x = display_width // 2
+            ball.y = display_height // 2
+            ball.vx = 0
+            ball.vy = 0
+            print("Right player scores!")
+        elif ball.x + ball.radius >= display_width:
+            # Ball touched right edge - left player scores
+            score['left'] += 1
+            ball.x = display_width // 2
+            ball.y = display_height // 2
+            ball.vx = 0
+            ball.vy = 0
+            print("Left player scores!")
+        
+        # Send game state to peer
+        if network.connected:
+            network.send_game_state(ball, my_hand, score)
+        
+        # Draw ball
+        ball.draw(canvas)
+        
+        # Draw my hand on my side
+        my_hand.draw(canvas)
+        
+        # Draw peer hand on their side
+        peer_hand.draw(canvas)
         
         # Draw UI
         mode_text = "SERVER" if is_host else "CLIENT"
         status_text = f"{mode_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
-        cv2.putText(frame, status_text, (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        cv2.putText(canvas, status_text, (10, display_height - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
         
-        cv2.putText(frame, f"Score: {score['left']} - {score['right']}", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        position_text = "LEFT Player" if is_left_player else "RIGHT Player"
-        cv2.putText(frame, position_text, (10, 90),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        if not has_ball:
-            cv2.putText(frame, "Waiting for ball...", (width // 2 - 100, height - 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 100), 2)
+        # Draw score
+        score_text = f"{score['left']} - {score['right']}"
+        cv2.putText(canvas, score_text, (display_width // 2 - 40, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
         
         # Check connection status
-        if not network.connected and is_host:
-            cv2.putText(frame, "Waiting for player to connect...", (width // 2 - 150, height // 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        if not network.connected:
+            cv2.putText(canvas, "Waiting for opponent...", (display_width // 2 - 150, display_height // 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
         
-        cv2.imshow('Multiplayer Hand Ball Game (TCP)', frame)
+        cv2.imshow('Multiplayer Hand Ball Game', canvas)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
