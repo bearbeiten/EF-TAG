@@ -77,96 +77,189 @@ class Ball:
 class NetworkManager:
     def __init__(self, port=5555):
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('0.0.0.0', port))
-        self.sock.settimeout(0.1)
+        self.server_socket = None
+        self.client_socket = None
+        self.connection = None
+        self.client_address = None
         
-        self.peer_ip = None
-        self.peer_port = port
+        self.is_server = False
         self.connected = False
         self.is_left_player = True
-        self.connection_confirmed = False
         
         self.received_ball = None
         self.last_receive_time = 0
         
         self.running = True
-        self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.receive_thread.start()
+        self.receive_thread = None
     
-    def _receive_loop(self):
-        while self.running:
+    def start_server(self):
+        """Start TCP server and wait for connection"""
+        self.is_server = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('0.0.0.0', self.port))
+        self.server_socket.listen(1)
+        self.server_socket.settimeout(1.0)
+        
+        print(f"Server listening on port {self.port}...")
+        
+        # Start accept thread
+        accept_thread = threading.Thread(target=self._accept_connection, daemon=True)
+        accept_thread.start()
+    
+    def _accept_connection(self):
+        """Accept incoming connection"""
+        while self.running and not self.connected:
             try:
-                data, addr = self.sock.recvfrom(4096)
-                message = json.loads(data.decode('utf-8'))
+                conn, addr = self.server_socket.accept()
+                print(f"Connection from {addr}")
                 
-                if message['type'] == 'connection_request':
-                    self._handle_connection_request(message, addr)
-                elif message['type'] == 'connection_accepted':
-                    self._handle_connection_accepted(message, addr)
-                elif message['type'] == 'ball_transfer':
-                    self._handle_ball_transfer(message)
-                elif message['type'] == 'ping':
-                    self._send_message({'type': 'pong'})
+                # Receive initial handshake
+                data = self._recv_message(conn)
+                if data and data['type'] == 'handshake':
+                    # Ask user to confirm
+                    root = tk.Tk()
+                    root.withdraw()
+                    result = messagebox.askyesno(
+                        "Connection Request",
+                        f"Player wants to connect from {addr[0]}\n"
+                        f"They are: {data['position']}\n"
+                        f"Accept?"
+                    )
+                    root.destroy()
                     
+                    if result:
+                        self.connection = conn
+                        self.client_address = addr
+                        self.is_left_player = (data['position'] == 'right')
+                        
+                        # Send acceptance
+                        position = 'left' if self.is_left_player else 'right'
+                        self._send_message({
+                            'type': 'handshake_accept',
+                            'position': position
+                        }, conn)
+                        
+                        self.connected = True
+                        print(f"Connection accepted! You are: {position}")
+                        
+                        # Start receive thread
+                        self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+                        self.receive_thread.start()
+                    else:
+                        conn.close()
+                        
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"Receive error: {e}")
+                if self.running:
+                    print(f"Accept error: {e}")
     
-    def _handle_connection_request(self, message, addr):
-        if not self.connected:
-            # Ask user if they want to connect
-            root = tk.Tk()
-            root.withdraw()
-            result = messagebox.askyesno(
-                "Connection Request",
-                f"Player wants to connect from {addr[0]}\nThey are: {message['position']}\nAccept?"
-            )
-            root.destroy()
+    def connect_to_server(self, host):
+        """Connect to TCP server as client"""
+        self.is_server = False
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.client_socket.settimeout(10.0)
+        
+        try:
+            print(f"Connecting to {host}:{self.port}...")
+            self.client_socket.connect((host, self.port))
             
-            if result:
-                self.peer_ip = addr[0]
-                self.is_left_player = (message['position'] == 'right')
-                position = 'left' if self.is_left_player else 'right'
-                self._send_message({
-                    'type': 'connection_accepted',
-                    'position': position
-                })
+            # Send handshake
+            position = 'left' if self.is_left_player else 'right'
+            self._send_message({
+                'type': 'handshake',
+                'position': position
+            }, self.client_socket)
+            
+            # Wait for acceptance
+            response = self._recv_message(self.client_socket)
+            if response and response['type'] == 'handshake_accept':
+                self.connection = self.client_socket
                 self.connected = True
-                self.connection_confirmed = True
-                print(f"Connection accepted! You are: {position}")
+                print(f"Connected! Peer is: {response['position']}")
+                
+                # Start receive thread
+                self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+                self.receive_thread.start()
+                return True
+            else:
+                print("Connection rejected")
+                self.client_socket.close()
+                return False
+                
+        except Exception as e:
+            print(f"Connection error: {e}")
+            if self.client_socket:
+                self.client_socket.close()
+            return False
     
-    def _handle_connection_accepted(self, message, addr):
-        self.peer_ip = addr[0]
-        self.connected = True
-        self.connection_confirmed = True
-        print(f"Connection accepted by peer! They are: {message['position']}")
+    def _recv_message(self, sock):
+        """Receive length-prefixed JSON message"""
+        try:
+            # First receive 4-byte length prefix
+            length_data = b''
+            while len(length_data) < 4:
+                chunk = sock.recv(4 - len(length_data))
+                if not chunk:
+                    return None
+                length_data += chunk
+            
+            message_length = int.from_bytes(length_data, 'big')
+            
+            # Receive the actual message
+            message_data = b''
+            while len(message_data) < message_length:
+                chunk = sock.recv(message_length - len(message_data))
+                if not chunk:
+                    return None
+                message_data += chunk
+            
+            return json.loads(message_data.decode('utf-8'))
+        except Exception as e:
+            print(f"Receive error: {e}")
+            return None
     
-    def _handle_ball_transfer(self, message):
-        self.received_ball = message['ball']
-        self.last_receive_time = time.time()
+    def _send_message(self, message, sock=None):
+        """Send length-prefixed JSON message"""
+        if sock is None:
+            sock = self.connection
+        
+        if sock is None:
+            return
+        
+        try:
+            data = json.dumps(message).encode('utf-8')
+            length = len(data).to_bytes(4, 'big')
+            sock.sendall(length + data)
+        except Exception as e:
+            print(f"Send error: {e}")
+            self.connected = False
     
-    def _send_message(self, message):
-        if self.peer_ip:
+    def _receive_loop(self):
+        """Main receive loop for handling messages"""
+        while self.running and self.connected:
             try:
-                data = json.dumps(message).encode('utf-8')
-                self.sock.sendto(data, (self.peer_ip, self.peer_port))
+                message = self._recv_message(self.connection)
+                if message is None:
+                    print("Connection closed by peer")
+                    self.connected = False
+                    break
+                
+                if message['type'] == 'ball_transfer':
+                    self.received_ball = message['ball']
+                    self.last_receive_time = time.time()
+                elif message['type'] == 'ping':
+                    self._send_message({'type': 'pong'})
+                    
             except Exception as e:
-                print(f"Send error: {e}")
-    
-    def request_connection(self, ip, is_left):
-        self.peer_ip = ip
-        self.is_left_player = is_left
-        position = 'left' if is_left else 'right'
-        self._send_message({
-            'type': 'connection_request',
-            'position': position
-        })
-        print(f"Connection request sent to {ip}. You are: {position}")
+                if self.running:
+                    print(f"Receive loop error: {e}")
+                self.connected = False
+                break
     
     def send_ball(self, ball):
+        """Send ball to peer"""
         if self.connected:
             self._send_message({
                 'type': 'ball_transfer',
@@ -174,13 +267,32 @@ class NetworkManager:
             })
     
     def get_received_ball(self):
+        """Get received ball data"""
         ball = self.received_ball
         self.received_ball = None
         return ball
     
     def close(self):
+        """Close all connections"""
         self.running = False
-        self.sock.close()
+        
+        if self.connection:
+            try:
+                self.connection.close()
+            except:
+                pass
+        
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+        
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
 
 def get_hand_polygon(hand_landmarks, width, height):
     points = []
@@ -290,11 +402,14 @@ def main():
     
     # Initialize network
     network = NetworkManager()
+    network.is_left_player = is_left_player
     
-    if not is_host and peer_ip:
-        network.request_connection(peer_ip, is_left_player)
+    if is_host:
+        network.start_server()
     else:
-        network.is_left_player = is_left_player
+        if not peer_ip or not network.connect_to_server(peer_ip):
+            print("Failed to connect to server")
+            return
     
     # Initialize MediaPipe Hands
     mp_hands = mp.solutions.hands
@@ -321,8 +436,9 @@ def main():
     
     hand_positions = deque(maxlen=5)
     
-    print("\n=== MULTIPLAYER HAND BALL GAME ===")
+    print("\n=== MULTIPLAYER HAND BALL GAME (TCP) ===")
     print(f"You are: {'LEFT' if is_left_player else 'RIGHT'} player")
+    print(f"Mode: {'SERVER' if is_host else 'CLIENT'}")
     print("Send the ball to the other side to score!")
     print("Press 'q' to quit")
     
@@ -438,7 +554,8 @@ def main():
             ball.draw(frame)
         
         # Draw UI
-        status_text = "CONNECTED" if network.connected else "WAITING..."
+        mode_text = "SERVER" if is_host else "CLIENT"
+        status_text = f"{mode_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
         cv2.putText(frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
@@ -454,7 +571,12 @@ def main():
             cv2.putText(frame, "Waiting for ball...", (width // 2 - 100, height - 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 100), 2)
         
-        cv2.imshow('Multiplayer Hand Ball Game', frame)
+        # Check connection status
+        if not network.connected and is_host:
+            cv2.putText(frame, "Waiting for player to connect...", (width // 2 - 150, height // 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        cv2.imshow('Multiplayer Hand Ball Game (TCP)', frame)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
