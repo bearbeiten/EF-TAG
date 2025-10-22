@@ -888,8 +888,15 @@ def main():
             time_since_interaction = now - last_interaction_time
             ball_velocity = abs(ball.vx) + abs(ball.vy)
             if time_since_interaction > authority_timeout and ball_velocity < 0.5:
-                ball.x = (cam_width // 2) if is_left_player else (cam_width + cam_width // 2)
-                ball.y = display_height // 2
+                # Determine which side to respawn on based on ball position
+                # Ball respawns on the side where it's currently stuck
+                if ball.x < cam_width:
+                    # Ball is on left side, respawn on left - drop from above
+                    ball.x = cam_width // 2
+                else:
+                    # Ball is on right side, respawn on right - drop from above
+                    ball.x = cam_width + cam_width // 2
+                ball.y = -ball.radius - 20  # Start above screen
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
                 authority_owner = 'host'
@@ -940,9 +947,9 @@ def main():
         if is_host:
             if ball.x - ball.radius <= 0:
                 score['right'] += 1
-                # Respawn on left (loser's side)
+                # Respawn on left (loser's side) - drop from above
                 ball.x = cam_width // 2
-                ball.y = display_height // 2
+                ball.y = -ball.radius - 20  # Start above screen
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
                 # Authority by respawn side
@@ -956,9 +963,9 @@ def main():
                 print(f"RIGHT SCORES! {score['left']} - {score['right']}")
             elif ball.x + ball.radius >= display_width:
                 score['left'] += 1
-                # Respawn on right (loser's side)
+                # Respawn on right (loser's side) - drop from above
                 ball.x = cam_width + cam_width // 2
-                ball.y = display_height // 2
+                ball.y = -ball.radius - 20  # Start above screen
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
                 authority_owner = 'host' if not is_left_player else 'client'
