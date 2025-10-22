@@ -457,27 +457,32 @@ def main():
     
     hand_positions = deque(maxlen=5)
     
-    # Start with left player having authority
-    is_ball_authority = is_left_player
-    last_ball_side = 'left'  # Track which side ball is on
+    # Authority system - simplified
+    # Left player has authority when ball is on left side (x < cam_width)
+    # Right player has authority when ball is on right side (x >= cam_width)
+    is_ball_authority = is_left_player  # Start with left player
+    
+    # Track previous ball X position to detect crossing
+    prev_ball_x = ball.x
     
     # Authority timeout tracking
-    last_authority_transfer_time = time.time()
+    last_interaction_time = time.time()
     authority_timeout = 15.0  # seconds
-    last_ball_velocity = 0
-    authority_reset_flag = False
     
     print("\n=== MULTIPLAYER HAND BALL GAME (SPLIT SCREEN) ===")
     print(f"You are: {'LEFT' if is_left_player else 'RIGHT'} player")
-    print(f"Mode: {'SERVER' if is_host else 'CLIENT'}")
+    print(f"Mode: {'SERVER (HOST)' if is_host else 'CLIENT'}")
     print("Hit the ball to the opponent's side!")
     print("Press 'q' to quit")
+    
+    frame_count = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
+        frame_count += 1
         frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -535,97 +540,59 @@ def main():
         
         # Get peer data
         peer_data = network.get_received_data()
-        peer_has_authority = False
-        peer_is_host = False
         
         if peer_data:
-            # Update peer hand
+            # Always update peer hand
             if 'hand' in peer_data:
                 peer_hand.from_dict(peer_data['hand'])
             
-            # Check if peer has authority and is host
-            peer_has_authority = peer_data.get('has_authority', False)
-            peer_is_host = peer_data.get('is_host', False)
+            # Always sync score from host
+            if peer_data.get('is_host', False) and 'score' in peer_data:
+                score = peer_data['score']
             
-            # Check for authority reset from host
-            if peer_data.get('authority_reset', False) and peer_is_host:
-                # Host has reset authority, accept their ball state
-                if 'ball' in peer_data:
-                    ball.from_dict(peer_data['ball'])
-                is_ball_authority = peer_has_authority and not is_host
-                last_authority_transfer_time = time.time()
-                
-                # Determine ball side from position
-                if ball.x < cam_width:
-                    last_ball_side = 'left'
-                else:
-                    last_ball_side = 'right'
-                
-                print("Authority reset by host - ball position synchronized")
-            elif peer_has_authority and 'ball' in peer_data:
-                # Normal update from peer with authority
+            # If peer has authority, use their ball state
+            if peer_data.get('has_authority', False) and 'ball' in peer_data:
                 ball.from_dict(peer_data['ball'])
-                last_authority_transfer_time = time.time()  # Reset timeout
-            
-            # Host has authority over score - client always accepts host's score
-            if 'score' in peer_data:
-                if peer_is_host:
-                    # Peer is host, accept their score as truth
-                    score = peer_data['score']
-                elif not is_host:
-                    # Neither is host (shouldn't happen), but just in case
-                    score = peer_data['score']
+                prev_ball_x = ball.x
+                last_interaction_time = time.time()
         
-        # Determine which side the ball is on
-        if ball.x < cam_width:
-            current_ball_side = 'left'
-        else:
-            current_ball_side = 'right'
+        # Determine authority based on ball position
+        # Left side: x < cam_width, Right side: x >= cam_width
+        ball_on_left = ball.x < cam_width
         
-        # Calculate ball velocity
-        current_ball_velocity = abs(ball.vx) + abs(ball.vy)
+        # Check if ball crossed center line
+        crossed_to_left = prev_ball_x >= cam_width and ball.x < cam_width
+        crossed_to_right = prev_ball_x < cam_width and ball.x >= cam_width
         
-        # Reset authority reset flag
-        authority_reset_flag = False
+        if crossed_to_left:
+            is_ball_authority = is_left_player
+            print(f"Ball crossed to LEFT - authority: {'YOU' if is_ball_authority else 'PEER'}")
+        elif crossed_to_right:
+            is_ball_authority = not is_left_player
+            print(f"Ball crossed to RIGHT - authority: {'YOU' if is_ball_authority else 'PEER'}")
         
-        # Check for authority timeout (ball stuck, no movement)
-        time_since_transfer = time.time() - last_authority_transfer_time
-        if time_since_transfer > authority_timeout and current_ball_velocity < 0.5:
-            # Ball hasn't moved in a while and no authority transfer
-            if is_host:
-                # Host claims authority and resets ball to host's side
-                is_ball_authority = True
-                authority_reset_flag = True
-                
-                # Spawn ball on host's side
-                if is_left_player:
-                    ball.x = cam_width // 2
-                    last_ball_side = 'left'
-                else:
-                    ball.x = cam_width + cam_width // 2
-                    last_ball_side = 'right'
-                
-                ball.y = display_height // 2
-                ball.vx = 0
-                ball.vy = 0
-                last_authority_transfer_time = time.time()
-                print("Authority timeout - host claiming ball control and resetting position")
+        # Store current position for next frame
+        prev_ball_x = ball.x
         
-        # Transfer authority if ball changed sides (only if no reset)
-        if current_ball_side != last_ball_side and not authority_reset_flag:
-            last_ball_side = current_ball_side
-            last_authority_transfer_time = time.time()  # Reset timeout
-            
-            # Authority transfers to player on ball's side
-            if (current_ball_side == 'left' and is_left_player) or \
-               (current_ball_side == 'right' and not is_left_player):
-                is_ball_authority = True
-                print(f"Authority transferred to you (ball on {current_ball_side} side)")
+        # Check for authority timeout
+        time_since_interaction = time.time() - last_interaction_time
+        ball_velocity = abs(ball.vx) + abs(ball.vy)
+        
+        if is_host and time_since_interaction > authority_timeout and ball_velocity < 0.5:
+            # Host reclaims authority and resets ball
+            is_ball_authority = True
+            if is_left_player:
+                ball.x = cam_width // 2
             else:
-                is_ball_authority = False
-                print(f"Authority transferred to peer (ball on {current_ball_side} side)")
+                ball.x = cam_width + cam_width // 2
+            ball.y = display_height // 2
+            ball.vx = 0
+            ball.vy = 0
+            prev_ball_x = ball.x
+            last_interaction_time = time.time()
+            print("HOST TIMEOUT RESET - Ball respawned")
         
-        # Only update ball physics if this player has authority
+        # Only simulate physics if we have authority
         if is_ball_authority:
             # Check collision with my hand
             if my_hand.check_collision(ball):
@@ -646,9 +613,9 @@ def main():
                     ball.x += dx * (overlap + 3)
                     ball.y += dy * (overlap + 3)
                 
-                last_authority_transfer_time = time.time()  # Reset timeout on interaction
+                last_interaction_time = time.time()
             
-            # Check collision with peer hand
+            # Check collision with peer hand (we still simulate it)
             if peer_hand.check_collision(ball):
                 dx = ball.x - peer_hand.x
                 dy = ball.y - peer_hand.y
@@ -658,93 +625,59 @@ def main():
                     dx /= dist
                     dy /= dist
                     
-                    # Push ball away from peer hand
                     overlap = (peer_hand.radius + ball.radius) - dist
                     ball.x += dx * (overlap + 3)
                     ball.y += dy * (overlap + 3)
-                    
-                    # Apply some force
                     ball.apply_force(dx * 5, dy * 5)
                 
-                last_authority_transfer_time = time.time()  # Reset timeout on interaction
+                last_interaction_time = time.time()
             
             # Update ball physics
             ball.update(display_width, display_height, floor_height)
             
-            # Check scoring - ANY player with authority can detect scoring, but only host updates score
-            scored = False
-            scoring_side = None
-            
-            if ball.x - ball.radius <= 0:
-                # Ball touched left edge - right player scores
-                scoring_side = 'right'
-                scored = True
-            elif ball.x + ball.radius >= display_width:
-                # Ball touched right edge - left player scores
-                scoring_side = 'left'
-                scored = True
-            
-            # If scoring detected
-            if scored:
-                # Only host updates the actual score
-                if is_host:
-                    if scoring_side == 'left':
-                        score['left'] += 1
-                        print(f"Left player scores! Score: {score['left']} - {score['right']}")
-                        # Spawn on right side (loser's side)
-                        ball.x = cam_width + cam_width // 2
-                        last_ball_side = 'right'
-                        is_ball_authority = not is_left_player
-                    else:  # scoring_side == 'right'
-                        score['right'] += 1
-                        print(f"Right player scores! Score: {score['left']} - {score['right']}")
-                        # Spawn on left side (loser's side)
-                        ball.x = cam_width // 2
-                        last_ball_side = 'left'
-                        is_ball_authority = is_left_player
-                    
+            # Only host can update score
+            if is_host:
+                # Check if ball hit left edge
+                if ball.x - ball.radius <= 0:
+                    score['right'] += 1
+                    # Respawn on left (loser's side)
+                    ball.x = cam_width // 2
                     ball.y = display_height // 2
                     ball.vx = 0
                     ball.vy = 0
-                    last_authority_transfer_time = time.time()
-                    authority_reset_flag = True  # Signal reset to client
-                else:
-                    # Client detected scoring but can't update score
-                    # Just report it and let host handle it
-                    print(f"Detected scoring by {scoring_side} player - waiting for host confirmation")
-                    # Reset ball locally and let host sync
-                    if scoring_side == 'left':
-                        ball.x = cam_width + cam_width // 2
-                        last_ball_side = 'right'
-                    else:
-                        ball.x = cam_width // 2
-                        last_ball_side = 'left'
-                    
+                    prev_ball_x = ball.x
+                    is_ball_authority = is_left_player
+                    last_interaction_time = time.time()
+                    print(f"RIGHT SCORES! {score['left']} - {score['right']}")
+                
+                # Check if ball hit right edge
+                elif ball.x + ball.radius >= display_width:
+                    score['left'] += 1
+                    # Respawn on right (loser's side)
+                    ball.x = cam_width + cam_width // 2
                     ball.y = display_height // 2
                     ball.vx = 0
                     ball.vy = 0
-                    is_ball_authority = False  # Give up authority, wait for host
-                    last_authority_transfer_time = time.time()
-        
-        last_ball_velocity = current_ball_velocity
+                    prev_ball_x = ball.x
+                    is_ball_authority = not is_left_player
+                    last_interaction_time = time.time()
+                    print(f"LEFT SCORES! {score['left']} - {score['right']}")
         
         # Send game state to peer
         if network.connected:
-            network.send_game_state(ball, my_hand, score, is_ball_authority, is_host, authority_reset_flag)
+            network.send_game_state(ball, my_hand, score, is_ball_authority, is_host, False)
         
         # Draw ball
         ball.draw(canvas)
         
-        # Draw my hand on my side
+        # Draw hands
         my_hand.draw(canvas)
-        
-        # Draw peer hand on their side
         peer_hand.draw(canvas)
         
         # Draw UI
-        mode_text = "SERVER" if is_host else "CLIENT"
-        authority_indicator = " [BALL CONTROL]" if is_ball_authority else ""
-        status_text = f"{mode_text}{authority_indicator} - {'CONNECTED' if network.connected else 'WAITING...'}"
+        mode_text = "HOST" if is_host else "CLIENT"
+        authority_text = " [CONTROLLING BALL]" if is_ball_authority else " [WATCHING]"
+        status_text = f"{mode_text}{authority_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
         cv2.putText(canvas, status_text, (10, display_height - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
