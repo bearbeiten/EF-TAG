@@ -69,6 +69,7 @@ class Ball:
         self.gravity = 0.5
         self.damping = 0.98
         self.bounce_damping = 0.7
+        self.max_speed = 25  # Maximum speed in pixels per frame
     
     def update(self, width, height, floor_height=100):
         # Apply gravity
@@ -77,6 +78,13 @@ class Ball:
         # Apply damping
         self.vx *= self.damping
         self.vy *= self.damping
+        
+        # Cap velocity to max speed
+        speed = np.sqrt(self.vx**2 + self.vy**2)
+        if speed > self.max_speed:
+            scale = self.max_speed / speed
+            self.vx *= scale
+            self.vy *= scale
         
         # Update position
         self.x += self.vx
