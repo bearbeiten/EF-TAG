@@ -73,20 +73,19 @@ class Ball:
         self.max_speed = 50  # Maximum speed in pixels per frame
     
     def update(self, width, height, floor_height=100):
-        # Apply damping first
+        # Apply gravity
+        self.vy += self.gravity
+        
+        # Apply damping
         self.vx *= self.damping
         self.vy *= self.damping
         
-        # Cap velocity to max speed BEFORE applying gravity
-        # This ensures player-generated momentum is capped but gravity can still accelerate the ball
+        # Cap velocity to max speed
         speed = np.sqrt(self.vx**2 + self.vy**2)
         if speed > self.max_speed:
             scale = self.max_speed / speed
             self.vx *= scale
             self.vy *= scale
-        
-        # Apply gravity AFTER capping (so gravity isn't limited by max_speed)
-        self.vy += self.gravity
         
         # Update position
         self.x += self.vx
