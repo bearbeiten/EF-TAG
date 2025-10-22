@@ -106,11 +106,11 @@ def cosine_similarity(emb1, emb2):
     return np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
 
 
-# Find matching face
+# Find matching face - returns match info and whether person exists in DB
 def find_match(embedding, threshold=0.3):
     faces = get_all_faces()
     if len(faces) == 0:
-        return None, -1.0
+        return None, -1.0, False  # No match, similarity, not in DB
 
     best_match = None
     best_similarity = -1
@@ -122,8 +122,8 @@ def find_match(embedding, threshold=0.3):
             best_match = name
 
     if best_similarity > threshold:
-        return best_match, best_similarity
-    return None, best_similarity
+        return best_match, best_similarity, True  # Match found, in DB
+    return None, best_similarity, False  # No match, not in DB
 
 
 # Eye Aspect Ratio (EAR) calculation
@@ -238,152 +238,156 @@ class MultiPersonTracker:
         self.distance_threshold = distance_threshold
 
     def get_face_center(self, bbox):
-        """Calculate center point of bounding box"""
-        return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+        """Get center point of bounding box"""
+        x1, y1, x2, y2 = bbox
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
 
     def update(self, faces):
         """
-        Update tracks with new detections
-        Returns: list of (track_id, face) tuples
+        Update tracks with new face detections
+        Returns: list of (track_id, face) tuples for active tracks
         """
-        if len(faces) == 0:
-            # Age out all tracks
-            for track_id in list(self.tracks.keys()):
-                self.tracks[track_id]["age"] += 1
-                if self.tracks[track_id]["age"] > self.max_age:
-                    del self.tracks[track_id]
-            return []
+        # Mark all existing tracks as unseen
+        for track_id in self.tracks:
+            self.tracks[track_id]["age"] += 1
 
-        # Calculate centers for all faces
-        face_centers = [self.get_face_center(face.bbox) for face in faces]
+        # Match detected faces to existing tracks
+        assigned_tracks = set()
+        updated_tracks = []
 
-        # Match faces to existing tracks
-        matched_tracks = set()
-        matched_faces = set()
-        assignments = []
+        for face in faces:
+            bbox = face.bbox.astype(int)
+            center = self.get_face_center(bbox)
 
-        # For each existing track, find closest detection
-        for track_id, track_data in self.tracks.items():
-            track_center = track_data["center"]
-            min_dist = float("inf")
-            best_face_idx = -1
+            # Find closest unassigned track
+            best_track = None
+            best_dist = float("inf")
 
-            for face_idx, face_center in enumerate(face_centers):
-                if face_idx in matched_faces:
+            for track_id, track_data in self.tracks.items():
+                if track_id in assigned_tracks:
                     continue
-                dist = np.linalg.norm(np.array(track_center) - np.array(face_center))
-                if dist < min_dist and dist < self.distance_threshold:
-                    min_dist = dist
-                    best_face_idx = face_idx
 
-            if best_face_idx >= 0:
-                matched_tracks.add(track_id)
-                matched_faces.add(best_face_idx)
-                assignments.append((track_id, best_face_idx))
-                # Update track
-                self.tracks[track_id]["center"] = face_centers[best_face_idx]
-                self.tracks[track_id]["bbox"] = faces[best_face_idx].bbox
-                self.tracks[track_id]["age"] = 0
+                # Calculate distance between centers
+                track_center = track_data["center"]
+                dist_val = np.sqrt(
+                    (center[0] - track_center[0]) ** 2
+                    + (center[1] - track_center[1]) ** 2
+                )
 
-        # Create new tracks for unmatched faces
-        for face_idx, face_center in enumerate(face_centers):
-            if face_idx not in matched_faces:
-                track_id = self.next_id
+                if dist_val < best_dist and dist_val < self.distance_threshold:
+                    best_dist = dist_val
+                    best_track = track_id
+
+            # Update existing track or create new
+            if best_track is not None:
+                self.tracks[best_track]["center"] = center
+                self.tracks[best_track]["bbox"] = bbox
+                self.tracks[best_track]["age"] = 0
+                assigned_tracks.add(best_track)
+                updated_tracks.append((best_track, face))
+            else:
+                # Create new track
+                new_id = self.next_id
                 self.next_id += 1
-                self.tracks[track_id] = {
-                    "center": face_center,
-                    "bbox": faces[face_idx].bbox,
+                self.tracks[new_id] = {
+                    "center": center,
+                    "bbox": bbox,
                     "liveness": MediaPipeBlinkDetector(),
                     "age": 0,
                 }
-                assignments.append((track_id, face_idx))
-                matched_tracks.add(track_id)
+                updated_tracks.append((new_id, face))
+                print(f"[new track] ID {new_id} created")
 
         # Remove old tracks
-        for track_id in list(self.tracks.keys()):
-            if track_id not in matched_tracks:
-                self.tracks[track_id]["age"] += 1
-                if self.tracks[track_id]["age"] > self.max_age:
-                    del self.tracks[track_id]
+        tracks_to_remove = [
+            tid for tid, tdata in self.tracks.items() if tdata["age"] > self.max_age
+        ]
+        for tid in tracks_to_remove:
+            print(f"[track lost] ID {tid} removed")
+            del self.tracks[tid]
 
-        # Return track_id, face pairs
-        return [(track_id, faces[face_idx]) for track_id, face_idx in assignments]
+        return updated_tracks
 
     def get_liveness_detector(self, track_id):
-        """Get the liveness detector for a specific track"""
+        """Get liveness detector for a specific track"""
         if track_id in self.tracks:
             return self.tracks[track_id]["liveness"]
         return None
 
-    def get_track_bbox(self, track_id):
-        """Get the bounding box for a specific track"""
-        if track_id in self.tracks:
-            return self.tracks[track_id]["bbox"]
-        return None
 
-
-# Helper function to find which MediaPipe face corresponds to which tracked face
-def match_mediapipe_to_tracks(mediapipe_results, tracker, img_shape):
+def match_mediapipe_to_tracks(mediapipe_results, tracker, frame_shape):
     """
-    Match MediaPipe face detections to tracked faces based on position
-    Returns: dict of track_id -> mediapipe_face_index
+    Match MediaPipe detected faces to tracked faces based on center proximity
+    Returns: dict mapping track_id -> mediapipe_face_index
     """
-    if not mediapipe_results or not mediapipe_results.multi_face_landmarks:
+    if (
+        mediapipe_results is None
+        or not mediapipe_results.multi_face_landmarks
+        or not tracker.tracks
+    ):
         return {}
 
-    height, width = img_shape[:2]
+    height, width = frame_shape[:2]
     matches = {}
 
-    # Get MediaPipe face centers
+    # Get centers of MediaPipe faces
     mp_centers = []
     for face_landmarks in mediapipe_results.multi_face_landmarks:
-        # Use nose tip as face center (landmark 1)
+        # Use nose tip (landmark 1) as center
         nose = face_landmarks.landmark[1]
-        center_x = int(nose.x * width)
-        center_y = int(nose.y * height)
-        mp_centers.append((center_x, center_y))
+        center = (int(nose.x * width), int(nose.y * height))
+        mp_centers.append(center)
 
-    # Match to tracked faces
-    for track_id in tracker.tracks:
-        track_center = tracker.tracks[track_id]["center"]
-        min_dist = float("inf")
-        best_mp_idx = -1
+    # Match each track to closest MediaPipe face
+    for track_id, track_data in tracker.tracks.items():
+        track_center = track_data["center"]
+        best_mp_idx = None
+        best_dist = float("inf")
 
         for mp_idx, mp_center in enumerate(mp_centers):
-            dist = np.linalg.norm(np.array(track_center) - np.array(mp_center))
-            if dist < min_dist and dist < 100:  # 100 pixel threshold
-                min_dist = dist
+            if mp_idx in matches.values():
+                continue  # Already assigned
+
+            dist_val = np.sqrt(
+                (track_center[0] - mp_center[0]) ** 2
+                + (track_center[1] - mp_center[1]) ** 2
+            )
+
+            if dist_val < best_dist and dist_val < 100:  # threshold
+                best_dist = dist_val
                 best_mp_idx = mp_idx
 
-        if best_mp_idx >= 0:
+        if best_mp_idx is not None:
             matches[track_id] = best_mp_idx
 
     return matches
 
 
-# Main program
 def main():
-    # Get name before running (optional for storage mode)
-    person_name = input(
-        "Enter name to store faces (or press Enter for recognition-only mode): "
-    ).strip()
-
     init_db()
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Multi-person face recognition with MediaPipe anti-spoofing"
+    )
+    parser.add_argument("--store", type=str, help="Name of person to store (optional)")
+    args = parser.parse_args()
+
+    person_name = args.store
+
+    cap = cv2.VideoCapture(0)
     tracker = MultiPersonTracker()
 
-    # Initialize webcam
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    print("\n[controls]")
-    if person_name:
-        print("  Press '1' to store current face(s)")
+    print("\n" + "=" * 60)
+    print("MEDIAPIPE ANTI-SPOOFING FACE RECOGNITION")
+    print("=" * 60)
+    print("  Press '1' to store detected LIVE faces (if --store specified)")
     print("  Press 'q' to quit")
     print("\n[status] MediaPipe-based blink detection active!")
-    print("[info] Each face starts as SPOOF until proper eye blinks are detected")
-    print("[info] System now uses Eye Aspect Ratio (EAR) for accurate blink detection")
-    print("[info] Cannot be fooled by covering/uncovering eyes\n")
+    print("[info] Unknown for faces not in database")
+    print("[info] SPOOF only for known faces that haven't blinked yet")
+    print("[info] System uses Eye Aspect Ratio (EAR) for accurate blink detection\n")
 
     store_mode = bool(person_name)
 
@@ -415,6 +419,10 @@ def main():
             liveness = tracker.get_liveness_detector(track_id)
             if liveness is None:
                 continue
+
+            # FIRST: Check if person is in database
+            embedding = face.normed_embedding
+            match, similarity, in_database = find_match(embedding)
 
             # Check if we have MediaPipe match for this track
             if track_id in mp_matches:
@@ -464,8 +472,48 @@ def main():
                     y = int(landmark.y * height)
                     cv2.circle(display_frame, (x, y), 2, (255, 0, 255), -1)
 
-            # Handle spoof state (not yet verified)
+            # NEW LOGIC: Handle based on DB presence and liveness
+            if not in_database:
+                # Person NOT in database -> Mark as Unknown (regardless of liveness)
+                cv2.rectangle(
+                    display_frame,
+                    (bbox[0], bbox[1]),
+                    (bbox[2], bbox[3]),
+                    (0, 165, 255),
+                    3,
+                )
+                cv2.putText(
+                    display_frame,
+                    "Unknown",
+                    (bbox[0], bbox[1] - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 165, 255),
+                    2,
+                )
+                cv2.putText(
+                    display_frame,
+                    f"Not in DB | best:{similarity:.2f}",
+                    (bbox[0], bbox[1] - 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (0, 165, 255),
+                    1,
+                )
+                cv2.putText(
+                    display_frame,
+                    f"EAR: {ear_value:.3f} | Blinks: {blink_count}",
+                    (bbox[0], bbox[1] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (0, 165, 255),
+                    1,
+                )
+                continue
+
+            # Person IS in database
             if not is_live:
+                # Known person but not verified live -> Mark as SPOOF
                 cv2.rectangle(
                     display_frame,
                     (bbox[0], bbox[1]),
@@ -475,17 +523,26 @@ def main():
                 )
                 cv2.putText(
                     display_frame,
-                    "SPOOF - BLINK NATURALLY",
-                    (bbox[0], bbox[1] - 45),
+                    f"{match} - SPOOF",
+                    (bbox[0], bbox[1] - 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                )
+                cv2.putText(
+                    display_frame,
+                    "BLINK NATURALLY TO VERIFY",
+                    (bbox[0], bbox[1] - 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
                     (0, 0, 255),
                     2,
                 )
                 cv2.putText(
                     display_frame,
                     f"EAR: {ear_value:.3f} | Blinks: {blink_count}",
-                    (bbox[0], bbox[1] - 20),
+                    (bbox[0], bbox[1] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.4,
                     (0, 0, 255),
@@ -493,20 +550,10 @@ def main():
                 )
                 continue
 
-            # Face is verified as live - proceed with recognition
-            embedding = face.normed_embedding
-            match, similarity = find_match(embedding)
-
-            if match:
-                label = f"{match}"
-                sublabel = f"conf:{similarity:.2f} | EAR:{ear_value:.3f}"
-                color = (0, 255, 0)
-                status_text = f"[LIVE] Track {track_id}: {match} | conf:{similarity:.2f} | blinks:{blink_count}"
-            else:
-                label = "Unknown (LIVE)"
-                sublabel = f"best:{similarity:.2f} | EAR:{ear_value:.3f}"
-                color = (0, 165, 255)
-                status_text = f"[LIVE] Track {track_id}: Unknown | best:{similarity:.2f} | blinks:{blink_count}"
+            # Known person AND verified live -> Show as verified
+            label = f"{match}"
+            sublabel = f"conf:{similarity:.2f} | EAR:{ear_value:.3f}"
+            color = (0, 255, 0)
 
             # Draw bounding box and labels
             cv2.rectangle(
