@@ -26,7 +26,7 @@ class Ball:
         self.target_y = y
         self.target_vx = 0
         self.target_vy = 0
-        self.interpolation_speed = 0.3  # Higher = faster catch-up
+        self.interpolation_speed = 0.6  # Higher = faster catch-up (increased from 0.3)
     
     def update(self, width, height, floor_height=100):
         # Apply gravity
@@ -99,10 +99,51 @@ class Ball:
     
     def interpolate_to_target(self):
         """Smoothly interpolate position towards target (for clients)"""
-        self.x += (self.target_x - self.x) * self.interpolation_speed
-        self.y += (self.target_y - self.y) * self.interpolation_speed
-        self.vx += (self.target_vx - self.vx) * self.interpolation_speed
-        self.vy += (self.target_vy - self.vy) * self.interpolation_speed
+        # Calculate distance to target
+        dist_x = abs(self.target_x - self.x)
+        dist_y = abs(self.target_y - self.y)
+        
+        # If we're very close to target, snap to it
+        if dist_x < 2 and dist_y < 2:
+            self.x = self.target_x
+            self.y = self.target_y
+            self.vx = self.target_vx
+            self.vy = self.target_vy
+        else:
+            # Interpolate position and velocity
+            self.x += (self.target_x - self.x) * self.interpolation_speed
+            self.y += (self.target_y - self.y) * self.interpolation_speed
+            self.vx += (self.target_vx - self.vx) * self.interpolation_speed
+            self.vy += (self.target_vy - self.vy) * self.interpolation_speed
+    
+    def predict_client_side(self, width, height, floor_height=100):
+        """Client-side prediction: simulate physics with current velocity"""
+        # Apply physics similar to update but gentler
+        self.vy += self.gravity * 0.5  # Reduced gravity for prediction
+        
+        self.vx *= self.damping
+        self.vy *= self.damping
+        
+        # Update position based on predicted velocity
+        self.x += self.vx
+        self.y += self.vy
+        
+        # Basic boundary checks (simplified, no bouncing)
+        if self.x < self.radius:
+            self.x = self.radius
+            self.vx = 0
+        elif self.x > width - self.radius:
+            self.x = width - self.radius
+            self.vx = 0
+        
+        if self.y < self.radius:
+            self.y = self.radius
+            self.vy = 0
+        
+        floor_y = height - floor_height
+        if self.y > floor_y - self.radius:
+            self.y = floor_y - self.radius
+            self.vy = 0
 
 class Hand:
     def __init__(self, radius=50):
@@ -185,9 +226,12 @@ class NetworkManager:
         
         # Network throttling
         self.last_send_time = 0
-        self.send_interval = 1.0 / 30.0  # Send at most 30 times per second
+        self.send_interval = 1.0 / 60.0  # Send at 60 FPS (increased from 30)
         self.last_hand_send_time = 0
-        self.hand_send_interval = 1.0 / 60.0  # Send hand updates more frequently
+        self.hand_send_interval = 1.0 / 60.0  # Send hand updates at 60 FPS
+        
+        # Thread safety
+        self.data_lock = threading.Lock()
     
     def start_server(self):
         """Start TCP server and wait for connection"""
@@ -342,7 +386,8 @@ class NetworkManager:
             return
         
         try:
-            data = json.dumps(message).encode('utf-8')
+            # Use separators to minimize JSON size
+            data = json.dumps(message, separators=(',', ':')).encode('utf-8')
             length = len(data).to_bytes(4, 'big')
             sock.sendall(length + data)
         except Exception as e:
@@ -351,9 +396,9 @@ class NetworkManager:
     
     def _receive_loop(self):
         """Main receive loop for handling messages"""
-        # Set socket to non-blocking mode with timeout
+        # Set socket to non-blocking mode with very short timeout
         if self.connection:
-            self.connection.settimeout(0.1)  # 100ms timeout
+            self.connection.settimeout(0.05)  # 50ms timeout (reduced from 100ms)
         
         while self.running and self.connected:
             try:
@@ -363,8 +408,9 @@ class NetworkManager:
                     continue
                 
                 if message['type'] == 'game_state':
-                    self.received_data = message
-                    self.last_receive_time = time.time()
+                    with self.data_lock:
+                        self.received_data = message
+                        self.last_receive_time = time.time()
                 elif message['type'] == 'ping':
                     self._send_message({'type': 'pong'})
                     
@@ -413,8 +459,9 @@ class NetworkManager:
             self.last_hand_send_time = current_time
     
     def get_received_data(self):
-        """Get received game state"""
-        return self.received_data
+        """Get received game state (thread-safe)"""
+        with self.data_lock:
+            return self.received_data
     
     def close(self):
         """Close all connections"""
@@ -555,8 +602,15 @@ def main():
     print("Press 'q' to quit")
     
     frame_count = 0
+    last_frame_time = time.time()
+    target_fps = 60
+    frame_delay = 1.0 / target_fps
+    fps_display = 60.0
+    fps_update_time = time.time()
     
     while cap.isOpened():
+        frame_start_time = time.time()
+        
         ret, frame = cap.read()
         if not ret:
             break
@@ -662,7 +716,7 @@ def main():
             last_interaction_time = time.time()
             print("HOST TIMEOUT RESET - Ball respawned")
         
-        # Host simulates physics, client interpolates
+        # Host simulates physics, client interpolates with prediction
         if is_host:
             # Check collision with my hand
             if my_hand.check_collision(ball):
@@ -705,8 +759,13 @@ def main():
             # Update ball physics (host only)
             ball.update(display_width, display_height, floor_height)
         else:
-            # Client: interpolate to received position
+            # Client: Use hybrid approach
+            # Interpolate towards server position while predicting movement
             ball.interpolate_to_target()
+            # Add client-side prediction for smoother movement
+            # Only predict if we have meaningful velocity
+            if abs(ball.vx) > 0.1 or abs(ball.vy) > 0.1:
+                ball.predict_client_side(display_width, display_height, floor_height)
             
             # Update score (host only)
             if ball.x - ball.radius <= 0:
@@ -752,6 +811,14 @@ def main():
         cv2.putText(canvas, status_text, (10, display_height - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
         
+        # Calculate and display FPS
+        current_time = time.time()
+        if current_time - fps_update_time > 0.5:  # Update FPS display every 0.5 seconds
+            fps_display = 1.0 / (current_time - last_frame_time) if (current_time - last_frame_time) > 0 else 60
+            fps_update_time = current_time
+        cv2.putText(canvas, f"FPS: {int(fps_display)}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
         # Draw score
         score_text = f"{score['left']} - {score['right']}"
         cv2.putText(canvas, score_text, (display_width // 2 - 40, 60),
@@ -764,9 +831,16 @@ def main():
         
         cv2.imshow('Multiplayer Hand Ball Game', canvas)
         
-        key = cv2.waitKey(1) & 0xFF
+        # Frame rate control for consistent timing
+        frame_elapsed = time.time() - frame_start_time
+        wait_time = max(1, int((frame_delay - frame_elapsed) * 1000))
+        
+        key = cv2.waitKey(wait_time) & 0xFF
         if key == ord('q'):
             break
+        
+        # Track actual FPS (optional, for debugging)
+        last_frame_time = time.time()
     
     network.close()
     cap.release()
