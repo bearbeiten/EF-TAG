@@ -457,15 +457,14 @@ def main():
     
     hand_positions = deque(maxlen=5)
     
-    # Authority system - simplified
-    # Left player has authority when ball is on left side (x < cam_width)
-    # Right player has authority when ball is on right side (x >= cam_width)
-    is_ball_authority = is_left_player  # Start with left player
+    # Authority system:
+    # Host is the only authority that simulates physics and decides authority.
+    is_ball_authority = is_host  # local authority equals host status
     
-    # Track previous ball X position to detect crossing
+    # Track previous ball X position for host-only logs if needed
     prev_ball_x = ball.x
     
-    # Authority timeout tracking
+    # Authority timeout tracking (host only)
     last_interaction_time = time.time()
     authority_timeout = 15.0  # seconds
     
@@ -546,41 +545,26 @@ def main():
             if 'hand' in peer_data:
                 peer_hand.from_dict(peer_data['hand'])
             
-            # Always sync score from host
-            if peer_data.get('is_host', False) and 'score' in peer_data:
-                score = peer_data['score']
-            
-            # If peer has authority, use their ball state
-            if peer_data.get('has_authority', False) and 'ball' in peer_data:
-                ball.from_dict(peer_data['ball'])
-                prev_ball_x = ball.x
-                last_interaction_time = time.time()
+            # Always trust host for score and ball state
+            if peer_data.get('is_host', False):
+                if 'score' in peer_data:
+                    score = peer_data['score']
+                if 'ball' in peer_data:
+                    ball.from_dict(peer_data['ball'])
+                    prev_ball_x = ball.x
+                    last_interaction_time = time.time()
         
-        # Determine authority based on ball position
-        # Left side: x < cam_width, Right side: x >= cam_width
-        ball_on_left = ball.x < cam_width
+        # Host decides authority and simulates physics; clients only render
+        # Remove local authority switching on center crossing.
+        # Previous crossing-based authority logic removed in favor of host authority.
         
-        # Check if ball crossed center line
-        crossed_to_left = prev_ball_x >= cam_width and ball.x < cam_width
-        crossed_to_right = prev_ball_x < cam_width and ball.x >= cam_width
-        
-        if crossed_to_left:
-            is_ball_authority = is_left_player
-            print(f"Ball crossed to LEFT - authority: {'YOU' if is_ball_authority else 'PEER'}")
-        elif crossed_to_right:
-            is_ball_authority = not is_left_player
-            print(f"Ball crossed to RIGHT - authority: {'YOU' if is_ball_authority else 'PEER'}")
-        
-        # Store current position for next frame
-        prev_ball_x = ball.x
-        
-        # Check for authority timeout
+        # Check for authority timeout (host only)
         time_since_interaction = time.time() - last_interaction_time
         ball_velocity = abs(ball.vx) + abs(ball.vy)
         
         if is_host and time_since_interaction > authority_timeout and ball_velocity < 0.5:
             # Host reclaims authority and resets ball
-            is_ball_authority = True
+            is_ball_authority = True  # host remains authority
             if is_left_player:
                 ball.x = cam_width // 2
             else:
@@ -592,8 +576,8 @@ def main():
             last_interaction_time = time.time()
             print("HOST TIMEOUT RESET - Ball respawned")
         
-        # Only simulate physics if we have authority
-        if is_ball_authority:
+        # Only host simulates physics and updates score
+        if is_host:
             # Check collision with my hand
             if my_hand.check_collision(ball):
                 dx = ball.x - my_hand.x
@@ -615,7 +599,7 @@ def main():
                 
                 last_interaction_time = time.time()
             
-            # Check collision with peer hand (we still simulate it)
+            # Check collision with peer hand
             if peer_hand.check_collision(ball):
                 dx = ball.x - peer_hand.x
                 dy = ball.y - peer_hand.y
@@ -635,37 +619,34 @@ def main():
             # Update ball physics
             ball.update(display_width, display_height, floor_height)
             
-            # Only host can update score
-            if is_host:
-                # Check if ball hit left edge
-                if ball.x - ball.radius <= 0:
-                    score['right'] += 1
-                    # Respawn on left (loser's side)
-                    ball.x = cam_width // 2
-                    ball.y = display_height // 2
-                    ball.vx = 0
-                    ball.vy = 0
-                    prev_ball_x = ball.x
-                    is_ball_authority = is_left_player
-                    last_interaction_time = time.time()
-                    print(f"RIGHT SCORES! {score['left']} - {score['right']}")
-                
-                # Check if ball hit right edge
-                elif ball.x + ball.radius >= display_width:
-                    score['left'] += 1
-                    # Respawn on right (loser's side)
-                    ball.x = cam_width + cam_width // 2
-                    ball.y = display_height // 2
-                    ball.vx = 0
-                    ball.vy = 0
-                    prev_ball_x = ball.x
-                    is_ball_authority = not is_left_player
-                    last_interaction_time = time.time()
-                    print(f"LEFT SCORES! {score['left']} - {score['right']}")
+            # Update score (host only)
+            if ball.x - ball.radius <= 0:
+                score['right'] += 1
+                # Respawn on left (loser's side)
+                ball.x = cam_width // 2
+                ball.y = display_height // 2
+                ball.vx = 0
+                ball.vy = 0
+                prev_ball_x = ball.x
+                is_ball_authority = True  # host remains authority
+                last_interaction_time = time.time()
+                print(f"RIGHT SCORES! {score['left']} - {score['right']}")
+            elif ball.x + ball.radius >= display_width:
+                score['left'] += 1
+                # Respawn on right (loser's side)
+                ball.x = cam_width + cam_width // 2
+                ball.y = display_height // 2
+                ball.vx = 0
+                ball.vy = 0
+                prev_ball_x = ball.x
+                is_ball_authority = True  # host remains authority
+                last_interaction_time = time.time()
+                print(f"LEFT SCORES! {score['left']} - {score['right']}")
         
-        # Send game state to peer
+        # Send game state to peer (host authoritative)
         if network.connected:
-            network.send_game_state(ball, my_hand, score, is_ball_authority, is_host, False)
+            # has_authority = True for host, False for client
+            network.send_game_state(ball, my_hand, score, is_host, is_host, False)
         
         # Draw ball
         ball.draw(canvas)
@@ -676,7 +657,7 @@ def main():
         
         # Draw UI
         mode_text = "HOST" if is_host else "CLIENT"
-        authority_text = " [CONTROLLING BALL]" if is_ball_authority else " [WATCHING]"
+        authority_text = " [CONTROLLING BALL]" if is_host else " [WATCHING]"
         status_text = f"{mode_text}{authority_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
         cv2.putText(canvas, status_text, (10, display_height - 10),
