@@ -2,6 +2,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from collections import deque
+import random
+import time
 
 class Ball:
     def __init__(self, x, y, radius=30):
@@ -48,6 +50,156 @@ class Ball:
     def draw(self, frame):
         cv2.circle(frame, (int(self.x), int(self.y)), self.radius, (0, 255, 255), -1)
         cv2.circle(frame, (int(self.x), int(self.y)), self.radius, (0, 200, 200), 2)
+
+class Target:
+    def __init__(self, x, y, radius=40, points=10, color=(255, 0, 0)):
+        self.x = x
+        self.y = y
+        self.radius = radius
+        self.points = points
+        self.color = color
+        self.hit = False
+        self.hit_time = 0
+    
+    def check_collision(self, ball):
+        dx = self.x - ball.x
+        dy = self.y - ball.y
+        distance = np.sqrt(dx**2 + dy**2)
+        return distance < (self.radius + ball.radius)
+    
+    def draw(self, frame, current_time):
+        if self.hit:
+            # Fade out animation
+            alpha = max(0, 1 - (current_time - self.hit_time) * 2)
+            if alpha > 0:
+                overlay = frame.copy()
+                cv2.circle(overlay, (int(self.x), int(self.y)), 
+                          int(self.radius * (1 + (1-alpha))), self.color, -1)
+                cv2.addWeighted(overlay, alpha * 0.5, frame, 1, 0, frame)
+            return alpha > 0
+        else:
+            # Draw target
+            cv2.circle(frame, (int(self.x), int(self.y)), self.radius, self.color, -1)
+            cv2.circle(frame, (int(self.x), int(self.y)), self.radius, (255, 255, 255), 2)
+            cv2.circle(frame, (int(self.x), int(self.y)), self.radius//2, (255, 255, 255), -1)
+            # Draw points
+            cv2.putText(frame, f"+{self.points}", (int(self.x)-15, int(self.y)+5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            return True
+
+class Game:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.score = 0
+        self.high_score = 0
+        self.targets = []
+        self.game_time = 60  # 60 seconds
+        self.start_time = time.time()
+        self.level = 1
+        self.targets_hit = 0
+        self.spawn_timer = 0
+        self.spawn_interval = 2.0  # seconds between spawns
+    
+    def spawn_target(self):
+        # Avoid spawning too close to edges
+        margin = 80
+        x = random.randint(margin, self.width - margin)
+        y = random.randint(margin, self.height - margin)
+        
+        # Different target types based on level
+        rand = random.random()
+        if rand < 0.6:  # 60% - Normal target
+            target = Target(x, y, radius=40, points=10, color=(255, 100, 0))
+        elif rand < 0.85:  # 25% - Small target (more points)
+            target = Target(x, y, radius=25, points=25, color=(0, 100, 255))
+        else:  # 15% - Large target (less points)
+            target = Target(x, y, radius=60, points=5, color=(100, 255, 100))
+        
+        self.targets.append(target)
+    
+    def update(self, ball):
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        remaining_time = max(0, self.game_time - elapsed)
+        
+        # Spawn targets
+        if remaining_time > 0:
+            self.spawn_timer += 1/30  # Assuming ~30 FPS
+            if self.spawn_timer >= self.spawn_interval:
+                self.spawn_target()
+                self.spawn_timer = 0
+                # Increase difficulty
+                if self.level < 5:
+                    self.spawn_interval = max(1.0, 2.0 - self.level * 0.2)
+        
+        # Check collisions
+        for target in self.targets[:]:
+            if not target.hit and target.check_collision(ball):
+                target.hit = True
+                target.hit_time = current_time
+                self.score += target.points
+                self.targets_hit += 1
+                
+                # Level up every 10 targets
+                new_level = (self.targets_hit // 10) + 1
+                if new_level > self.level:
+                    self.level = new_level
+        
+        # Remove faded targets
+        self.targets = [t for t in self.targets if not t.hit or 
+                       (current_time - t.hit_time) < 0.5]
+        
+        # Update high score
+        if self.score > self.high_score:
+            self.high_score = self.score
+        
+        return remaining_time
+    
+    def draw(self, frame, remaining_time):
+        current_time = time.time()
+        
+        # Draw targets
+        for target in self.targets:
+            target.draw(frame, current_time)
+        
+        # Draw UI
+        ui_y = 30
+        cv2.putText(frame, f"Score: {self.score}", (10, ui_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"High Score: {self.high_score}", (10, ui_y + 35),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        cv2.putText(frame, f"Level: {self.level}", (10, ui_y + 65),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        
+        # Timer
+        timer_text = f"Time: {int(remaining_time)}s"
+        timer_color = (0, 255, 0) if remaining_time > 10 else (0, 0, 255)
+        cv2.putText(frame, timer_text, (self.width - 150, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, timer_color, 2)
+        
+        # Game over screen
+        if remaining_time <= 0:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (self.width//4, self.height//3),
+                         (3*self.width//4, 2*self.height//3), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+            
+            cv2.putText(frame, "GAME OVER!", (self.width//2 - 120, self.height//2 - 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+            cv2.putText(frame, f"Final Score: {self.score}", (self.width//2 - 100, self.height//2 + 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, "Press SPACE to restart", (self.width//2 - 130, self.height//2 + 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+    
+    def reset(self):
+        self.score = 0
+        self.targets = []
+        self.start_time = time.time()
+        self.level = 1
+        self.targets_hit = 0
+        self.spawn_timer = 0
+        self.spawn_interval = 2.0
 
 def get_hand_polygon(hand_landmarks, width, height):
     """Extract hand contour points from all landmarks"""
@@ -137,17 +289,24 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Initialize ball
+    # Initialize ball and game
     ball = Ball(width // 2, height // 2)
+    game = Game(width, height)
     
     # Hand position history for velocity calculation
     hand_positions = deque(maxlen=5)
     hand_polygon_history = deque(maxlen=3)
     
-    print("Controls:")
-    print("- Move your hand to interact with the ball")
+    print("=== HAND BALL TARGET GAME ===")
+    print("Hit targets with the ball to score points!")
+    print("Different colors = different points")
+    print("- Orange (large): 10 points")
+    print("- Blue (small): 25 points") 
+    print("- Green (huge): 5 points")
+    print("\nControls:")
+    print("- Move your hand to push the ball")
+    print("- Press SPACE to restart after game over")
     print("- Press 'q' to quit")
-    print("- Press 'r' to reset ball position")
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -186,8 +345,6 @@ def main():
                     hand_center_y = int(M["m01"] / M["m00"])
                     
                     cv2.circle(frame, (hand_center_x, hand_center_y), 10, (255, 0, 0), -1)
-                    
-                    # Add to position history
                     hand_positions.append((hand_center_x, hand_center_y))
                 
                 hand_polygon_history.append(hand_polygon)
@@ -203,54 +360,45 @@ def main():
             collision, closest_point, penetration_dist = check_collision_with_polygon(ball, hand_polygon)
             
             if collision:
-                # Calculate push direction (from hand center to ball)
                 if hand_center_x is not None:
                     dx = ball.x - hand_center_x
                     dy = ball.y - hand_center_y
                     dist = np.sqrt(dx**2 + dy**2)
                     
                     if dist > 0:
-                        # Normalize direction
                         dx /= dist
                         dy /= dist
                         
-                        # Apply impulse based on hand velocity and penetration
                         impulse_strength = 2.0
                         ball.apply_force(hand_vx * impulse_strength + dx * 5, 
                                        hand_vy * impulse_strength + dy * 5)
                         
-                        # Push ball out of hand
                         ball.x += dx * 3
                         ball.y += dy * 3
                 
-                # Visual feedback
                 cv2.circle(frame, (int(ball.x), int(ball.y)), ball.radius + 5, (0, 0, 255), 3)
         
-        # Update and draw ball
+        # Update ball and game
         ball.update(width, height)
+        remaining_time = game.update(ball)
+        
+        # Draw everything
+        game.draw(frame, remaining_time)
         ball.draw(frame)
         
-        # Draw info
-        cv2.putText(frame, f"Ball Vel: ({ball.vx:.1f}, {ball.vy:.1f})", 
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        if hand_center_x is not None:
-            cv2.putText(frame, f"Hand Vel: ({hand_vx:.1f}, {hand_vy:.1f})", 
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, "Press 'q' to quit, 'r' to reset", 
-                    (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
         # Display frame
-        cv2.imshow('Hand Ball Game', frame)
+        cv2.imshow('Hand Ball Target Game', frame)
         
         # Handle keyboard input
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('r'):
+        elif key == ord(' '):  # Spacebar to restart
             ball.x = width // 2
             ball.y = height // 2
             ball.vx = 0
             ball.vy = 0
+            game.reset()
     
     cap.release()
     cv2.destroyAllWindows()
