@@ -465,13 +465,15 @@ def main():
         received_ball_data = network.get_received_ball()
         if received_ball_data and not has_ball:
             ball.from_dict(received_ball_data)
-            # Flip ball position for opposite screen
+            # Flip ball position and velocity for opposite screen
             if is_left_player:
-                ball.x = 100
-                ball.vx = abs(ball.vx)
-            else:
+                # Ball coming from right side - should enter from right
                 ball.x = width - 100
-                ball.vx = -abs(ball.vx)
+                ball.vx = -abs(ball.vx)  # Force leftward velocity
+            else:
+                # Ball coming from left side - should enter from left
+                ball.x = 100
+                ball.vx = abs(ball.vx)  # Force rightward velocity
             has_ball = True
             print("Ball received!")
         
