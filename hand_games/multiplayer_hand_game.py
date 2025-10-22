@@ -458,9 +458,7 @@ def main():
     hand_positions = deque(maxlen=5)
 
     # Authority ownership controlled by the host only.
-    # Values: 'host' or 'client'
     authority_owner = 'host'
-    # Local convenience flag for who simulates on this machine
     local_has_control = is_host  # initially host controls
 
     # Track previous ball position
@@ -469,16 +467,46 @@ def main():
     # Host-side anomaly and authority management
     last_interaction_time = time.time()
     authority_timeout = 15.0  # seconds
-    client_timeout = 0.5      # seconds without client updates -> revoke
+    client_timeout = 0.35     # seconds without client updates -> revoke
     max_jump_per_frame = 250  # px jump in 1 frame -> revoke
     pos_margin = 100          # px allowed beyond bounds before revoke
 
+    # Hysteresis to avoid flapping
+    hysteresis_margin = 40        # px margin inside a half before switching
+    switch_dwell_time = 0.20      # seconds the ball must dwell on a half before switching
+    authority_cooldown = 0.50     # seconds after a switch before another switch allowed
+    last_authority_change_time = time.time()
+    side_enter_time = time.time() # when the ball entered current half band
+
+    # Track last time host received a client ball update (for timeout)
+    last_client_ball_rx_time = 0.0
+
     def is_on_client_side(x):
-        # Only meaningful on the host: determine which half belongs to client
-        if is_left_player:  # host is left
+        # Host perspective: which half belongs to the client
+        if is_left_player:   # host is left
             return x >= cam_width
-        else:               # host is right
+        else:                # host is right
             return x < cam_width
+
+    def is_on_client_side_with_margin(x):
+        # Apply hysteresis margin
+        if is_left_player:   # host is left
+            return x >= (cam_width + hysteresis_margin)
+        else:
+            return x <= (cam_width - hysteresis_margin)
+
+    def is_on_host_side_with_margin(x):
+        if is_left_player:   # host is left
+            return x <= (cam_width - hysteresis_margin)
+        else:
+            return x >= (cam_width + hysteresis_margin)
+
+    def is_in_center_band(x):
+        return (cam_width - hysteresis_margin) < x < (cam_width + hysteresis_margin)
+
+    def is_on_my_side(x):
+        # Local perspective: is the ball on my half (no hysteresis, just gating)
+        return x < cam_width if is_left_player else x >= cam_width
 
     def ball_state_is_valid(candidate, prev_x, prev_y):
         try:
@@ -488,12 +516,10 @@ def main():
             return False
         if not np.isfinite([x, y, vx, vy]).all():
             return False
-        # Soft bounds
         if x < -pos_margin or x > (display_width + pos_margin):
             return False
         if y < -pos_margin or y > (display_height + pos_margin):
             return False
-        # Sudden jump check (host frame cadence)
         if abs(x - prev_x) > max_jump_per_frame or abs(y - prev_y) > max_jump_per_frame:
             return False
         return True
@@ -567,9 +593,11 @@ def main():
             hand_vx = (hand_positions[-1][0] - hand_positions[0][0]) / len(hand_positions)
             hand_vy = (hand_positions[-1][1] - hand_positions[0][1]) / len(hand_positions)
         
+        # To send this frame (host may set on anomaly)
+        authority_reset_to_send = False
+
         # Get peer data
         peer_data = network.get_received_data()
-        
         if peer_data:
             # Always update peer hand
             if 'hand' in peer_data:
@@ -581,61 +609,112 @@ def main():
                     score = peer_data['score']
                 if 'authority_owner' in peer_data:
                     authority_owner = peer_data['authority_owner'] or 'host'
-                # Only apply host ball state when host owns authority
-                if authority_owner != 'client' and 'ball' in peer_data:
+                # On explicit reset from host, snap to host state unconditionally
+                if peer_data.get('authority_reset', False) and 'ball' in peer_data:
                     ball.from_dict(peer_data['ball'])
                     prev_ball_x, prev_ball_y = ball.x, ball.y
                     last_interaction_time = time.time()
-            else:
-                # Message from client (host only cares)
-                if is_host and authority_owner == 'client' and 'ball' in peer_data:
-                    candidate = peer_data['ball']
-                    if ball_state_is_valid(candidate, prev_ball_x, prev_ball_y):
-                        ball.from_dict(candidate)
+                else:
+                    # Only apply host ball state when host owns authority
+                    if authority_owner != 'client' and 'ball' in peer_data:
+                        ball.from_dict(peer_data['ball'])
                         prev_ball_x, prev_ball_y = ball.x, ball.y
                         last_interaction_time = time.time()
-                    else:
-                        # Revoke immediately on invalid state
-                        authority_owner = 'host'
-                        print("Authority revoked due to invalid client state")
+            else:
+                # Message from client (host cares)
+                if is_host:
+                    # Track last time client sent anything (for timeout)
+                    last_client_ball_rx_time = time.time()
+                    if authority_owner == 'client' and 'ball' in peer_data:
+                        candidate = peer_data['ball']
+                        if ball_state_is_valid(candidate, prev_ball_x, prev_ball_y):
+                            ball.from_dict(candidate)
+                            prev_ball_x, prev_ball_y = ball.x, ball.y
+                            last_interaction_time = time.time()
+                        else:
+                            # Revoke immediately on invalid state
+                            authority_owner = 'host'
+                            authority_reset_to_send = True
+                            # Snap ball to a safe host-side center
+                            ball.x = (cam_width // 2) if is_left_player else (cam_width + cam_width // 2)
+                            ball.y = display_height // 2
+                            ball.vx = 0; ball.vy = 0
+                            prev_ball_x, prev_ball_y = ball.x, ball.y
+                            last_authority_change_time = time.time()
+                            print("Authority revoked due to invalid client state")
 
         # Host decides ownership transitions and anomalies
         if is_host:
-            # Timeout: no client updates while client owns
-            if authority_owner == 'client' and (time.time() - network.last_receive_time) > client_timeout:
+            now = time.time()
+
+            # Client timeout while client should own
+            if authority_owner == 'client' and (now - last_client_ball_rx_time) > client_timeout:
                 authority_owner = 'host'
+                authority_reset_to_send = True
+                ball.x = (cam_width // 2) if is_left_player else (cam_width + cam_width // 2)
+                ball.y = display_height // 2
+                ball.vx = 0; ball.vy = 0
+                prev_ball_x, prev_ball_y = ball.x, ball.y
+                last_authority_change_time = now
                 print("Authority revoked due to client timeout")
 
-            # Natural ownership switch by half
-            if authority_owner == 'host' and is_on_client_side(ball.x):
-                authority_owner = 'client'
-                print("Authority granted to client (ball on client side)")
-            elif authority_owner == 'client' and not is_on_client_side(ball.x):
+            # If client owns but ball is not on client side (with margin), revoke
+            if authority_owner == 'client' and not is_on_client_side_with_margin(ball.x) and not is_in_center_band(ball.x):
                 authority_owner = 'host'
-                print("Authority returned to host (ball on host side)")
+                authority_reset_to_send = True
+                ball.x = (cam_width // 2) if is_left_player else (cam_width + cam_width // 2)
+                ball.y = display_height // 2
+                ball.vx = 0; ball.vy = 0
+                prev_ball_x, prev_ball_y = ball.x, ball.y
+                last_authority_change_time = now
+                print("Authority revoked due to side mismatch")
+
+            # Natural ownership switch by half with hysteresis/dwell/cooldown (no reset)
+            desired_owner = None
+            if is_on_client_side_with_margin(ball.x):
+                desired_owner = 'client'
+            elif is_on_host_side_with_margin(ball.x):
+                desired_owner = 'host'
+            else:
+                desired_owner = None  # center band: no switch
+
+            if desired_owner is not None:
+                # track dwell inside this desired half
+                # reset dwell timer if entering a new desired half
+                if desired_owner != authority_owner:
+                    # If desired is different than current owner, ensure dwell and cooldown
+                    if is_on_client_side_with_margin(ball.x) or is_on_host_side_with_margin(ball.x):
+                        # Initialize/refresh side_enter_time the first time we see this desired half
+                        side_enter_time = side_enter_time if 'last_desired_owner' in locals() and last_desired_owner == desired_owner else now
+                        last_desired_owner = desired_owner
+                        if (now - last_authority_change_time) >= authority_cooldown and (now - side_enter_time) >= switch_dwell_time:
+                            authority_owner = desired_owner
+                            last_authority_change_time = now
+                            print(f"Authority changed to {authority_owner} (hysteresis)")
+                else:
+                    # Already matches, keep tracking
+                    last_desired_owner = desired_owner
 
             # Host-controlled idle timeout respawn
-            time_since_interaction = time.time() - last_interaction_time
+            time_since_interaction = now - last_interaction_time
             ball_velocity = abs(ball.vx) + abs(ball.vy)
             if time_since_interaction > authority_timeout and ball_velocity < 0.5:
-                # Respawn on current half position
-                if is_left_player:
-                    ball.x = cam_width // 2
-                else:
-                    ball.x = cam_width + cam_width // 2
+                ball.x = (cam_width // 2) if is_left_player else (cam_width + cam_width // 2)
                 ball.y = display_height // 2
-                ball.vx = 0
-                ball.vy = 0
+                ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
                 authority_owner = 'host'
-                last_interaction_time = time.time()
+                authority_reset_to_send = True
+                last_interaction_time = now
+                last_authority_change_time = now
                 print("HOST TIMEOUT RESET - Ball respawned")
 
-        # Local control: host controls when authority_owner == 'host', client controls when == 'client'
+        # Local control: authority AND ball must be on my side to simulate (prevents desync feeling)
         local_has_control = (authority_owner == ('host' if is_host else 'client'))
+        simulate_locally = local_has_control and is_on_my_side(ball.x)
 
         # Physics simulation only on the side with local control
-        if local_has_control:
+        if simulate_locally:
             # Check collision with my hand
             if my_hand.check_collision(ball):
                 dx = ball.x - my_hand.x
@@ -672,45 +751,46 @@ def main():
         if is_host:
             if ball.x - ball.radius <= 0:
                 score['right'] += 1
-                # Respawn on left (loser's side)
                 ball.x = cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
-                # Decide authority by side of respawn
-                authority_owner = 'host' if (is_left_player) else 'client'
+                # Authority by respawn side
+                authority_owner = 'host' if is_left_player else 'client'
+                authority_reset_to_send = True
                 last_interaction_time = time.time()
+                last_authority_change_time = time.time()
                 print(f"RIGHT SCORES! {score['left']} - {score['right']}")
             elif ball.x + ball.radius >= display_width:
                 score['left'] += 1
-                # Respawn on right (loser's side)
                 ball.x = cam_width + cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
-                # Decide authority by side of respawn
-                authority_owner = 'host' if (not is_left_player) else 'client'
+                authority_owner = 'host' if not is_left_player else 'client'
+                authority_reset_to_send = True
                 last_interaction_time = time.time()
+                last_authority_change_time = time.time()
                 print(f"LEFT SCORES! {score['left']} - {score['right']}")
 
-        # Send game state (host authoritative about authority_owner)
+        # Send game state (host authoritative about authority_owner, include resets)
         if network.connected:
             if is_host:
                 network.send_game_state(
                     ball, my_hand, score,
                     has_authority=(authority_owner == 'host'),
                     is_host=True,
-                    authority_reset=False,
+                    authority_reset=authority_reset_to_send,
                     authority_owner=authority_owner
                 )
             else:
-                # Client sends ball only to drive host while owning authority
+                # Client sends ball to host only when it believes it owns control
                 network.send_game_state(
                     ball, my_hand, score,
                     has_authority=(authority_owner == 'client'),
                     is_host=False,
                     authority_reset=False,
-                    authority_owner=authority_owner  # informational; host decides anyway
+                    authority_owner=authority_owner
                 )
 
         # Draw ball/hands/UI
@@ -719,7 +799,7 @@ def main():
         peer_hand.draw(canvas)
 
         mode_text = "HOST" if is_host else "CLIENT"
-        authority_text = " [CONTROLLING BALL]" if local_has_control else " [WATCHING]"
+        authority_text = " [CONTROLLING BALL]" if simulate_locally else " [WATCHING]"
         status_text = f"{mode_text}{authority_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
         cv2.putText(canvas, status_text, (10, display_height - 10),
