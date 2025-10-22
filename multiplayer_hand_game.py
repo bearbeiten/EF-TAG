@@ -453,9 +453,13 @@ def main():
     
     hand_positions = deque(maxlen=5)
     
+    # Server is authoritative over ball physics
+    is_ball_authority = is_host
+    
     print("\n=== MULTIPLAYER HAND BALL GAME (SPLIT SCREEN) ===")
     print(f"You are: {'LEFT' if is_left_player else 'RIGHT'} player")
     print(f"Mode: {'SERVER' if is_host else 'CLIENT'}")
+    print(f"Ball authority: {'YES' if is_ball_authority else 'NO'}")
     print("Hit the ball to the opponent's side!")
     print("Press 'q' to quit")
     
@@ -526,51 +530,75 @@ def main():
             if 'hand' in peer_data:
                 peer_hand.from_dict(peer_data['hand'])
             
+            # If not ball authority, update ball from peer
+            if not is_ball_authority and 'ball' in peer_data:
+                ball.from_dict(peer_data['ball'])
+            
             # Sync score
             if 'score' in peer_data:
                 score = peer_data['score']
         
-        # Check collision with my hand
-        if my_hand.check_collision(ball):
-            dx = ball.x - my_hand.x
-            dy = ball.y - my_hand.y
-            dist = np.sqrt(dx**2 + dy**2)
+        # Only update ball physics if this player is the authority
+        if is_ball_authority:
+            # Check collision with my hand
+            if my_hand.check_collision(ball):
+                dx = ball.x - my_hand.x
+                dy = ball.y - my_hand.y
+                dist = np.sqrt(dx**2 + dy**2)
+                
+                if dist > 0:
+                    dx /= dist
+                    dy /= dist
+                    
+                    impulse_strength = 2.0
+                    ball.apply_force(hand_vx * impulse_strength + dx * 5, 
+                                   hand_vy * impulse_strength + dy * 5)
+                    
+                    # Push ball out of hand
+                    overlap = (my_hand.radius + ball.radius) - dist
+                    ball.x += dx * (overlap + 3)
+                    ball.y += dy * (overlap + 3)
             
-            if dist > 0:
-                dx /= dist
-                dy /= dist
+            # Check collision with peer hand
+            if peer_hand.check_collision(ball):
+                dx = ball.x - peer_hand.x
+                dy = ball.y - peer_hand.y
+                dist = np.sqrt(dx**2 + dy**2)
                 
-                impulse_strength = 2.0
-                ball.apply_force(hand_vx * impulse_strength + dx * 5, 
-                               hand_vy * impulse_strength + dy * 5)
-                
-                # Push ball out of hand
-                overlap = (my_hand.radius + ball.radius) - dist
-                ball.x += dx * (overlap + 3)
-                ball.y += dy * (overlap + 3)
+                if dist > 0:
+                    dx /= dist
+                    dy /= dist
+                    
+                    # Push ball away from peer hand
+                    overlap = (peer_hand.radius + ball.radius) - dist
+                    ball.x += dx * (overlap + 3)
+                    ball.y += dy * (overlap + 3)
+                    
+                    # Apply some force
+                    ball.apply_force(dx * 5, dy * 5)
+            
+            # Update ball physics
+            ball.update(display_width, display_height, floor_height)
+            
+            # Check scoring (ball touches opponent's edge)
+            if ball.x - ball.radius <= 0:
+                # Ball touched left edge - right player scores
+                score['right'] += 1
+                ball.x = display_width // 2
+                ball.y = display_height // 2
+                ball.vx = 0
+                ball.vy = 0
+                print("Right player scores!")
+            elif ball.x + ball.radius >= display_width:
+                # Ball touched right edge - left player scores
+                score['left'] += 1
+                ball.x = display_width // 2
+                ball.y = display_height // 2
+                ball.vx = 0
+                ball.vy = 0
+                print("Left player scores!")
         
-        # Update ball physics
-        ball.update(display_width, display_height, floor_height)
-        
-        # Check scoring (ball touches opponent's edge)
-        if ball.x - ball.radius <= 0:
-            # Ball touched left edge - right player scores
-            score['right'] += 1
-            ball.x = display_width // 2
-            ball.y = display_height // 2
-            ball.vx = 0
-            ball.vy = 0
-            print("Right player scores!")
-        elif ball.x + ball.radius >= display_width:
-            # Ball touched right edge - left player scores
-            score['left'] += 1
-            ball.x = display_width // 2
-            ball.y = display_height // 2
-            ball.vx = 0
-            ball.vy = 0
-            print("Left player scores!")
-        
-        # Send game state to peer
+        # Send game state to peer (always send current state)
         if network.connected:
             network.send_game_state(ball, my_hand, score)
         
