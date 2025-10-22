@@ -17,7 +17,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 # Game settings
 ANSWER_TIME = 10  # seconds to answer each question
-POINTS_PER_CORRECT = 10
+POINTS_PER_CORRECT = 1
 
 
 class QuizGame:
@@ -58,7 +58,7 @@ class QuizGame:
         return max(0, remaining)
     
     def process_answer(self, player, gesture):
-        """Process a player's answer gesture"""
+        """Process a player's answer gesture - allows changing vote"""
         if self.showing_results or self.game_over:
             return
         
@@ -69,13 +69,22 @@ class QuizGame:
         elif "Thumb_Down" in gesture or "Thumbs_Down" in gesture:
             answer = False
         
+        # Update the current vote (can be changed multiple times)
         if answer is not None:
-            if player == 1 and not self.player1_answered:
+            if player == 1:
                 self.player1_answered = True
                 self.player1_answer = answer
-            elif player == 2 and not self.player2_answered:
+            elif player == 2:
                 self.player2_answered = True
                 self.player2_answer = answer
+        else:
+            # If no gesture detected, reset the answered status
+            if player == 1:
+                self.player1_answered = False
+                self.player1_answer = None
+            elif player == 2:
+                self.player2_answered = False
+                self.player2_answer = None
     
     def check_answers(self):
         """Check if time is up, then evaluate"""
@@ -214,28 +223,29 @@ def draw_game_ui(frame, game):
     
     question = game.questions[game.current_question]
     
-    # Draw question box at top
-    cv2.rectangle(frame, (10, 10), (w - 10, 150), (50, 50, 50), -1)
-    cv2.rectangle(frame, (10, 10), (w - 10, 150), (255, 255, 255), 2)
+    # Draw question box at top - make it taller
+    cv2.rectangle(frame, (10, 10), (w - 10, 180), (50, 50, 50), -1)
+    cv2.rectangle(frame, (10, 10), (w - 10, 180), (255, 255, 255), 2)
     
     # Question number and timer
     time_remaining = game.get_time_remaining()
     timer_color = (0, 255, 0) if time_remaining > 3 else (0, 0, 255)
     
-    cv2.putText(frame, f"Question {game.current_question + 1}/{len(game.questions)}", 
-               (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Q {game.current_question + 1}/{len(game.questions)}", 
+               (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.putText(frame, f"Time: {int(time_remaining)}s", 
                (w - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, timer_color, 2)
     
-    # Question text (word wrap)
+    # Question text (word wrap) - improved with smaller font and more lines
     question_text = question['question']
     words = question_text.split()
     lines = []
     current_line = ""
+    max_chars = 100  # Increased character limit
     
     for word in words:
         test_line = current_line + " " + word if current_line else word
-        if len(test_line) < 70:  # Approximate character limit per line
+        if len(test_line) < max_chars:
             current_line = test_line
         else:
             lines.append(current_line)
@@ -244,31 +254,51 @@ def draw_game_ui(frame, game):
         lines.append(current_line)
     
     y_offset = 70
-    for line in lines[:2]:  # Max 2 lines
-        cv2.putText(frame, line, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        y_offset += 35
+    for line in lines[:3]:  # Allow up to 3 lines
+        cv2.putText(frame, line, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 30
     
     # Player 1 (left) info
-    cv2.putText(frame, "PLAYER 1", (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-    cv2.putText(frame, f"Score: {game.player1_score}", (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, "PLAYER 1", (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+    cv2.putText(frame, f"Score: {game.player1_score}", (20, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    if game.player1_answered:
-        answer_text = "TRUE" if game.player1_answer else "FALSE"
-        cv2.putText(frame, f"Answer: {answer_text}", (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # Show current vote during voting period
+    if not game.showing_results:
+        if game.player1_answered:
+            answer_text = "TRUE" if game.player1_answer else "FALSE"
+            cv2.putText(frame, f"Vote: {answer_text}", (20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No Vote Yet", (20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, "Thumbs Up = TRUE", (20, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        cv2.putText(frame, "Thumbs Down = FALSE", (20, 335), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
     else:
-        cv2.putText(frame, "Thumbs Up = TRUE", (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(frame, "Thumbs Down = FALSE", (20, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Show final answer after time is up
+        if game.player1_answered:
+            answer_text = "TRUE" if game.player1_answer else "FALSE"
+            cv2.putText(frame, f"Answer: {answer_text}", (20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No Answer", (20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
     
     # Player 2 (right) info
-    cv2.putText(frame, "PLAYER 2", (mid_x + 20, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-    cv2.putText(frame, f"Score: {game.player2_score}", (mid_x + 20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, "PLAYER 2", (mid_x + 20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+    cv2.putText(frame, f"Score: {game.player2_score}", (mid_x + 20, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    if game.player2_answered:
-        answer_text = "TRUE" if game.player2_answer else "FALSE"
-        cv2.putText(frame, f"Answer: {answer_text}", (mid_x + 20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # Show current vote during voting period
+    if not game.showing_results:
+        if game.player2_answered:
+            answer_text = "TRUE" if game.player2_answer else "FALSE"
+            cv2.putText(frame, f"Vote: {answer_text}", (mid_x + 20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No Vote Yet", (mid_x + 20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, "Thumbs Up = TRUE", (mid_x + 20, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        cv2.putText(frame, "Thumbs Down = FALSE", (mid_x + 20, 335), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
     else:
-        cv2.putText(frame, "Thumbs Up = TRUE", (mid_x + 20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(frame, "Thumbs Down = FALSE", (mid_x + 20, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Show final answer after time is up
+        if game.player2_answered:
+            answer_text = "TRUE" if game.player2_answer else "FALSE"
+            cv2.putText(frame, f"Answer: {answer_text}", (mid_x + 20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No Answer", (mid_x + 20, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
     
     # Show results if time is up
     if game.showing_results:
@@ -284,14 +314,17 @@ def draw_game_ui(frame, game):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Show who got it right
-        p1_result = "✓" if game.player1_answered and game.player1_answer == question['answer'] else "✗"
-        p2_result = "✓" if game.player2_answered and game.player2_answer == question['answer'] else "✗"
+        p1_correct = game.player1_answered and game.player1_answer == question['answer']
+        p2_correct = game.player2_answered and game.player2_answer == question['answer']
         
-        p1_color = (0, 255, 0) if p1_result == "✓" else (0, 0, 255)
-        p2_color = (0, 255, 0) if p2_result == "✓" else (0, 0, 255)
+        p1_result = "CORRECT" if p1_correct else "WRONG"
+        p2_result = "CORRECT" if p2_correct else "WRONG"
         
-        cv2.putText(frame, f"P1: {p1_result}", (50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, p1_color, 2)
-        cv2.putText(frame, f"P2: {p2_result}", (mid_x + 50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, p2_color, 2)
+        p1_color = (0, 255, 0) if p1_correct else (0, 0, 255)
+        p2_color = (0, 255, 0) if p2_correct else (0, 0, 255)
+        
+        cv2.putText(frame, f"P1: {p1_result}", (50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p1_color, 2)
+        cv2.putText(frame, f"P2: {p2_result}", (mid_x + 50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p2_color, 2)
 
 
 def main():
