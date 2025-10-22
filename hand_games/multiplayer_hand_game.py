@@ -175,42 +175,36 @@ class NetworkManager:
             try:
                 conn, addr = self.server_socket.accept()
                 print(f"Connection from {addr}")
-                
                 # Receive initial handshake
                 data = self._recv_message(conn)
                 if data and data['type'] == 'handshake':
                     # Ask user to confirm
-                    root = tk.Tk()
-                    root.withdraw()
+                    root = tk.Tk(); root.withdraw()
                     result = messagebox.askyesno(
                         "Connection Request",
                         f"Player wants to connect from {addr[0]}\n"
-                        f"They are: {data['position']}\n"
+                        f"They claim: {data['position']}\n"
                         f"Accept?"
                     )
                     root.destroy()
-                    
                     if result:
                         self.connection = conn
                         self.client_address = addr
-                        self.is_left_player = (data['position'] == 'right')
-                        
-                        # Send acceptance
-                        position = 'left' if self.is_left_player else 'right'
+                        # Do NOT override host side based on client claim.
+                        # Host side is already set (self.is_left_player). Assign peer accordingly.
+                        peer_position = 'right' if self.is_left_player else 'left'
+                        # Send acceptance with assigned peer position
                         self._send_message({
                             'type': 'handshake_accept',
-                            'position': position
+                            'position': peer_position
                         }, conn)
-                        
                         self.connected = True
-                        print(f"Connection accepted! You are: {position}")
-                        
+                        print(f"Connection accepted! You are: {'left' if self.is_left_player else 'right'}; Peer is: {peer_position}")
                         # Start receive thread
                         self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
                         self.receive_thread.start()
                     else:
                         conn.close()
-                        
             except socket.timeout:
                 continue
             except Exception as e:
@@ -222,26 +216,20 @@ class NetworkManager:
         self.is_server = False
         self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.client_socket.settimeout(10.0)
-        
         try:
             print(f"Connecting to {host}:{self.port}...")
             self.client_socket.connect((host, self.port))
-            
-            # Send handshake
+            # Send handshake with client's initial preference; host decides final
             position = 'left' if self.is_left_player else 'right'
-            self._send_message({
-                'type': 'handshake',
-                'position': position
-            }, self.client_socket)
-            
+            self._send_message({'type': 'handshake','position': position}, self.client_socket)
             # Wait for acceptance
             response = self._recv_message(self.client_socket)
             if response and response['type'] == 'handshake_accept':
+                # Host assigns our side; adopt it
+                self.is_left_player = (response['position'] == 'left')
                 self.connection = self.client_socket
                 self.connected = True
-                print(f"Connected! Peer is: {response['position']}")
-                
-                # Start receive thread
+                print(f"Connected! You are: {response['position']}")
                 self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
                 self.receive_thread.start()
                 return True
@@ -249,7 +237,6 @@ class NetworkManager:
                 print("Connection rejected")
                 self.client_socket.close()
                 return False
-                
         except Exception as e:
             print(f"Connection error: {e}")
             if self.client_socket:
@@ -425,7 +412,9 @@ def main():
         if not peer_ip or not network.connect_to_server(peer_ip):
             print("Failed to connect to server")
             return
-    
+        # Client adopts host-assigned side after handshake_accept
+        is_left_player = network.is_left_player
+
     # Initialize MediaPipe Hands
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
@@ -457,69 +446,42 @@ def main():
     score = {'left': 0, 'right': 0}
     hand_positions = deque(maxlen=5)
 
-    # Authority ownership controlled by the host only.
+    # Authority and stability variables
     authority_owner = 'host'
-    local_has_control = is_host  # initially host controls
-
-    # Track previous ball position
+    local_has_control = is_host
     prev_ball_x, prev_ball_y = ball.x, ball.y
-
-    # Host-side anomaly and authority management
     last_interaction_time = time.time()
-    authority_timeout = 15.0  # seconds
-    client_timeout = 0.8      # seconds without client updates -> revoke (increased)
-    max_jump_per_frame = 250  # px jump in 1 frame -> revoke
-    pos_margin = 100          # px allowed beyond bounds before revoke
+    authority_timeout = 15.0
+    client_timeout = 0.8
+    max_jump_per_frame = 250
+    pos_margin = 100
 
-    # Hysteresis to avoid flapping
-    hysteresis_margin = 40        # px margin inside a half before switching
-    switch_dwell_time = 0.25      # seconds the ball must dwell on a half before switching
-    authority_cooldown = 0.50     # seconds after a switch before another switch allowed
+    hysteresis_margin = 40
+    switch_dwell_time = 0.25
+    authority_cooldown = 0.50
     last_authority_change_time = time.time()
-    # Track which side is currently "desired" based on hysteresis and since when
-    desired_side = None           # 'host' | 'client' | None
+    desired_side = None
     desired_since = time.time()
-
-    # Track last time host received a client ball update (for timeout)
     last_client_ball_rx_time = time.time()
 
     def is_on_client_side(x):
-        # Host perspective: which half belongs to the client
-        if is_left_player:   # host is left
-            return x >= cam_width
-        else:                # host is right
-            return x < cam_width
-
+        return x >= cam_width if is_left_player else x < cam_width
     def is_on_client_side_with_margin(x):
-        # Apply hysteresis margin
-        if is_left_player:   # host is left
-            return x >= (cam_width + hysteresis_margin)
-        else:
-            return x <= (cam_width - hysteresis_margin)
-
+        return x >= (cam_width + hysteresis_margin) if is_left_player else x <= (cam_width - hysteresis_margin)
     def is_on_host_side_with_margin(x):
-        if is_left_player:   # host is left
-            return x <= (cam_width - hysteresis_margin)
-        else:
-            return x >= (cam_width + hysteresis_margin)
-
+        return x <= (cam_width - hysteresis_margin) if is_left_player else x >= (cam_width + hysteresis_margin)
     def is_in_center_band(x):
         return (cam_width - hysteresis_margin) < x < (cam_width + hysteresis_margin)
-
     def ball_state_is_valid(candidate, prev_x, prev_y):
         try:
             x = float(candidate['x']); y = float(candidate['y'])
             vx = float(candidate['vx']); vy = float(candidate['vy'])
         except Exception:
             return False
-        if not np.isfinite([x, y, vx, vy]).all():
-            return False
-        if x < -pos_margin or x > (display_width + pos_margin):
-            return False
-        if y < -pos_margin or y > (display_height + pos_margin):
-            return False
-        if abs(x - prev_x) > max_jump_per_frame or abs(y - prev_y) > max_jump_per_frame:
-            return False
+        if not np.isfinite([x, y, vx, vy]).all(): return False
+        if x < -pos_margin or x > (display_width + pos_margin): return False
+        if y < -pos_margin or y > (display_height + pos_margin): return False
+        if abs(x - prev_x) > max_jump_per_frame or abs(y - prev_y) > max_jump_per_frame: return False
         return True
 
     print("\n=== MULTIPLAYER HAND BALL GAME (SPLIT SCREEN) ===")
@@ -607,7 +569,7 @@ def main():
                     score = peer_data['score']
                 if 'authority_owner' in peer_data:
                     authority_owner = peer_data['authority_owner'] or 'host'
-                # On explicit reset from host, snap to host state unconditionally
+                # If host signals reset/handoff, always snap to host ball state
                 if peer_data.get('authority_reset', False) and 'ball' in peer_data:
                     ball.from_dict(peer_data['ball'])
                     prev_ball_x, prev_ball_y = ball.x, ball.y
@@ -667,27 +629,22 @@ def main():
                 last_authority_change_time = now
                 print("Authority revoked due to side mismatch")
 
-            # Natural ownership switch by half with hysteresis/dwell/cooldown (no reset)
-            new_desired = None
-            if is_on_client_side_with_margin(ball.x):
-                new_desired = 'client'
-            elif is_on_host_side_with_margin(ball.x):
-                new_desired = 'host'
-            # Update desired side tracking
+            # Hysteresis switch (no reposition); send a handoff snapshot so the client starts from the exact state
+            new_desired = 'client' if is_on_client_side_with_margin(ball.x) else ('host' if is_on_host_side_with_margin(ball.x) else None)
             if new_desired != desired_side:
                 desired_side = new_desired
                 desired_since = now
-            # Perform switch if stable and cooled down
             if desired_side is not None and desired_side != authority_owner:
                 if (now - last_authority_change_time) >= authority_cooldown and (now - desired_since) >= switch_dwell_time:
                     authority_owner = desired_side
                     last_authority_change_time = now
                     if authority_owner == 'client':
-                        # Give client time to start sending before timeout triggers
                         last_client_ball_rx_time = now
-                    print(f"Authority changed to {authority_owner} (hysteresis)")
+                    # Important: signal a handoff snapshot (no teleport: we keep current ball state)
+                    authority_reset_to_send = True
+                    print(f"Authority changed to {authority_owner} (handoff)")
 
-            # Host-controlled idle timeout respawn
+            # Idle timeout respawn (host)
             time_since_interaction = now - last_interaction_time
             ball_velocity = abs(ball.vx) + abs(ball.vy)
             if time_since_interaction > authority_timeout and ball_velocity < 0.5:
@@ -701,12 +658,12 @@ def main():
                 last_authority_change_time = now
                 print("HOST TIMEOUT RESET - Ball respawned")
 
-        # Local control: simulate whenever you have authority (no side gating)
+        # Local simulation: simulate whenever you have authority
         local_has_control = (authority_owner == ('host' if is_host else 'client'))
         simulate_locally = local_has_control
 
-        # Physics simulation only on the side with local control
         if simulate_locally:
+            # Collisions and physics
             # Check collision with my hand
             if my_hand.check_collision(ball):
                 dx = ball.x - my_hand.x
@@ -739,10 +696,11 @@ def main():
             ball.update(display_width, display_height, floor_height)
             prev_ball_x, prev_ball_y = ball.x, ball.y
 
-        # Host always scores (even when client has authority)
+        # Host scoring and respawn to losing side
         if is_host:
             if ball.x - ball.radius <= 0:
                 score['right'] += 1
+                # Respawn on LEFT (loser's side)
                 ball.x = cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0; ball.vy = 0
@@ -754,6 +712,7 @@ def main():
                 print(f"RIGHT SCORES! {score['left']} - {score['right']}")
             elif ball.x + ball.radius >= display_width:
                 score['left'] += 1
+                # Respawn on RIGHT (loser's side)
                 ball.x = cam_width + cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0; ball.vy = 0
@@ -764,7 +723,7 @@ def main():
                 last_authority_change_time = time.time()
                 print(f"LEFT SCORES! {score['left']} - {score['right']}")
 
-        # Send game state (host authoritative about authority_owner, include resets)
+        # Send game state
         if network.connected:
             if is_host:
                 network.send_game_state(
@@ -775,7 +734,6 @@ def main():
                     authority_owner=authority_owner
                 )
             else:
-                # Client sends ball to host only when it believes it owns control
                 network.send_game_state(
                     ball, my_hand, score,
                     has_authority=(authority_owner == 'client'),
@@ -784,7 +742,7 @@ def main():
                     authority_owner=authority_owner
                 )
 
-        # Draw ball/hands/UI
+        # Draw and UI
         ball.draw(canvas)
         my_hand.draw(canvas)
         peer_hand.draw(canvas)
