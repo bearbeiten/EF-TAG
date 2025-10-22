@@ -9,6 +9,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 import math  # One Euro filter needs math
+import os
 
 # -------- One Euro Filter (low-latency smoothing) --------
 class _LowPassFilter:
@@ -512,17 +513,66 @@ def main():
             print("Failed to connect to server")
             return
     
-    # Initialize MediaPipe Hands
+    # Initialize MediaPipe Hands (prefer GPU Tasks if available)
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
-    hands = mp_hands.Hands(
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-        max_num_hands=1
-    )
-    
-    # Initialize webcam
+
+    use_tasks_gpu = False
+    hand_task = None
+    try:
+        # Try MediaPipe Tasks Hand Landmarker with GPU
+        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+
+        model_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+        if os.path.exists(model_path):
+            options = HandLandmarkerOptions(
+                base_options=BaseOptions(
+                    model_asset_path=model_path,
+                    delegate=BaseOptions.Delegate.GPU  # try GPU
+                ),
+                running_mode=RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.6,
+                min_hand_presence_confidence=0.6,
+                min_tracking_confidence=0.6,
+            )
+            hand_task = HandLandmarker.create_from_options(options)
+            use_tasks_gpu = True
+            print("Using MediaPipe Tasks HandLandmarker with GPU delegate")
+        else:
+            print("hand_landmarker.task not found; using mp.solutions Hands (CPU)")
+    except Exception as e:
+        print(f"GPU Tasks init failed or not available: {e}\nFalling back to mp.solutions Hands (CPU)")
+
+    # Fallback CPU solution (lighter model for speed)
+    hands = None
+    if not use_tasks_gpu:
+        hands = mp_hands.Hands(
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6,
+            max_num_hands=1,
+            model_complexity=0  # speed-up on CPU
+        )
+
+    # Initialize webcam (lower resolution, higher FPS if possible)
     cap = cv2.VideoCapture(0)
+    # Request MJPG to unlock higher FPS on many webcams
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    except Exception:
+        pass
+    # Request higher FPS and lower resolution
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Reduce internal buffering to lower latency (may be ignored on some backends)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    # Read back actual capture properties
     cam_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
@@ -646,30 +696,41 @@ def main():
         cv2.putText(canvas, "RIGHT", (cam_width + 20, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
-        # Process hand detection
-        results = hands.process(rgb_frame)
-        
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                hand_polygon = get_hand_polygon(hand_landmarks, cam_width, cam_height)
-                
-                # Calculate hand center
-                M = cv2.moments(hand_polygon)
-                if M["m00"] != 0:
-                    hand_center_x = int(M["m10"] / M["m00"])
-                    hand_center_y = int(M["m01"] / M["m00"])
-                    
-                    # Offset to full canvas position
-                    if is_left_player:
-                        canvas_x = hand_center_x
-                    else:
-                        canvas_x = cam_width + hand_center_x
-                    
-                    my_hand.update(canvas_x, hand_center_y)
-                    # Append smoothed position for velocity calc
-                    if my_hand.display_x is not None and my_hand.display_y is not None:
-                        hand_positions.append((my_hand.display_x, my_hand.display_y))
-        
+        # Process hand detection (GPU Tasks if available, otherwise CPU Solutions)
+        if use_tasks_gpu and hand_task is not None:
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                result = hand_task.detect_for_video(mp_image, int(time.time() * 1000))
+                if result and result.hand_landmarks:
+                    for landmarks in result.hand_landmarks:
+                        # Compute hand center from normalized landmarks
+                        xs = [int(l.x * cam_width) for l in landmarks]
+                        ys = [int(l.y * cam_height) for l in landmarks]
+                        hand_center_x = int(sum(xs) / len(xs))
+                        hand_center_y = int(sum(ys) / len(ys))
+                        # Offset to full canvas position
+                        canvas_x = hand_center_x if is_left_player else (cam_width + hand_center_x)
+                        my_hand.update(canvas_x, hand_center_y)
+                        if my_hand.display_x is not None and my_hand.display_y is not None:
+                            hand_positions.append((my_hand.display_x, my_hand.display_y))
+            except Exception as e:
+                # If anything goes wrong, skip this frame's detection
+                # (fallback is already selected at init time)
+                pass
+        else:
+            results = hands.process(rgb_frame)
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    hand_polygon = get_hand_polygon(hand_landmarks, cam_width, cam_height)
+                    M = cv2.moments(hand_polygon)
+                    if M["m00"] != 0:
+                        hand_center_x = int(M["m10"] / M["m00"])
+                        hand_center_y = int(M["m01"] / M["m00"])
+                        canvas_x = hand_center_x if is_left_player else (cam_width + hand_center_x)
+                        my_hand.update(canvas_x, hand_center_y)
+                        if my_hand.display_x is not None and my_hand.display_y is not None:
+                            hand_positions.append((my_hand.display_x, my_hand.display_y))
+
         # Check hand timeout
         my_hand.check_timeout()
         
