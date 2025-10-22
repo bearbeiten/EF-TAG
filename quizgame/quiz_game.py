@@ -241,22 +241,33 @@ def draw_game_ui(frame, game):
     words = question_text.split()
     lines = []
     current_line = ""
-    max_chars = 100  # Increased character limit
+    # Use very small font to ensure it fits
+    font_scale = 0.4
     
     for word in words:
         test_line = current_line + " " + word if current_line else word
-        if len(test_line) < max_chars:
+        # Use OpenCV to get actual text size
+        (text_width, _), _ = cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        # Leave margins on both sides (40px total)
+        if text_width < (w - 40):
             current_line = test_line
         else:
-            lines.append(current_line)
+            if current_line:
+                lines.append(current_line)
             current_line = word
     if current_line:
         lines.append(current_line)
     
-    y_offset = 70
-    for line in lines[:3]:  # Allow up to 3 lines
-        cv2.putText(frame, line, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        y_offset += 30
+    # If we have too many lines, truncate with "..."
+    max_lines = 4
+    y_offset = 65
+    line_height = 25
+    for i, line in enumerate(lines[:max_lines]):
+        if i == max_lines - 1 and len(lines) > max_lines:
+            # Truncate last line if there are more lines
+            line = line[:80] + "..."
+        cv2.putText(frame, line, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+        y_offset += line_height
     
     # Player 1 (left) info
     cv2.putText(frame, "PLAYER 1", (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
@@ -302,16 +313,45 @@ def draw_game_ui(frame, game):
     
     # Show results if time is up
     if game.showing_results:
-        # Semi-transparent overlay
+        # Semi-transparent overlay - make it taller for longer explanations
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h - 200), (w, h), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, h - 250), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         correct_answer = "TRUE" if question['answer'] else "FALSE"
-        cv2.putText(frame, f"Correct Answer: {correct_answer}", (w//2 - 200, h - 150), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-        cv2.putText(frame, question['explanation'], (20, h - 100), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Correct: {correct_answer}", (w//2 - 150, h - 210), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        
+        # Word wrap the explanation to fit inside the overlay
+        explanation_text = question['explanation']
+        words = explanation_text.split()
+        lines = []
+        current_line = ""
+        font_scale = 0.45
+        
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            (text_width, _), _ = cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            # Leave margins (40px total)
+            if text_width < (w - 40):
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        # Display up to 5 lines of explanation with smaller spacing
+        y_offset = h - 170
+        line_height = 25
+        max_explanation_lines = 5
+        for i, line in enumerate(lines[:max_explanation_lines]):
+            if i == max_explanation_lines - 1 and len(lines) > max_explanation_lines:
+                # Truncate if too long
+                line = line[:80] + "..."
+            cv2.putText(frame, line, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+            y_offset += line_height
         
         # Show who got it right
         p1_correct = game.player1_answered and game.player1_answer == question['answer']
@@ -323,8 +363,8 @@ def draw_game_ui(frame, game):
         p1_color = (0, 255, 0) if p1_correct else (0, 0, 255)
         p2_color = (0, 255, 0) if p2_correct else (0, 0, 255)
         
-        cv2.putText(frame, f"P1: {p1_result}", (50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p1_color, 2)
-        cv2.putText(frame, f"P2: {p2_result}", (mid_x + 50, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p2_color, 2)
+        cv2.putText(frame, f"P1: {p1_result}", (50, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p1_color, 2)
+        cv2.putText(frame, f"P2: {p2_result}", (mid_x + 50, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, p2_color, 2)
 
 
 def main():
