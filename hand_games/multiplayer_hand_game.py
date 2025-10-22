@@ -8,6 +8,56 @@ import json
 import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog
+import math  # One Euro filter needs math
+
+# -------- One Euro Filter (low-latency smoothing) --------
+class _LowPassFilter:
+    def __init__(self, alpha, initval=None):
+        self.alpha = alpha
+        self.s = initval
+        self.initialized = initval is not None
+
+    def apply(self, x, alpha=None):
+        if alpha is not None:
+            self.alpha = alpha
+        if not self.initialized:
+            self.s = x
+            self.initialized = True
+            return x
+        self.s = self.alpha * x + (1.0 - self.alpha) * self.s
+        return self.s
+
+def _alpha(cutoff, dt):
+    tau = 1.0 / (2.0 * math.pi * cutoff)
+    return 1.0 / (1.0 + tau / dt) if dt > 0 else 1.0
+
+class OneEuroFilter:
+    def __init__(self, min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=None, init_time=None):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_filter = _LowPassFilter(alpha=1.0, initval=initval)
+        self.dx_filter = _LowPassFilter(alpha=1.0, initval=0.0 if initval is not None else None)
+        self.last_time = init_time
+
+    def apply(self, x, t=None):
+        now = t if t is not None else time.time()
+        if self.last_time is None:
+            dt = 1.0 / 60.0  # assume ~60 FPS on first call
+        else:
+            dt = max(1e-3, now - self.last_time)
+        self.last_time = now
+
+        # Estimate derivative
+        dx = 0.0
+        if self.x_filter.initialized:
+            dx = (x - self.x_filter.s) / dt
+        edx = self.dx_filter.apply(dx, _alpha(self.d_cutoff, dt))
+
+        # Dynamic cutoff
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        # Filtered signal
+        return self.x_filter.apply(x, _alpha(cutoff, dt))
 
 class Ball:
     def __init__(self, x, y, radius=30):
@@ -79,58 +129,86 @@ class Hand:
     def __init__(self, radius=50):
         self.x = None
         self.y = None
+        # Smoothed/drawn position
+        self.display_x = None
+        self.display_y = None
         self.radius = radius
         self.is_active = False
         self.last_seen_time = 0
         self.timeout = 0.5  # seconds before hand disappears
-    
-    def update(self, center_x, center_y):
-        """Update hand position when detected"""
+
+        # One Euro filters for low-latency smoothing
+        # Tune min_cutoff/beta to trade jitter vs. responsiveness
+        self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0)
+        self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0)
+
+    def update(self, center_x, center_y, t=None):
+        """Update hand position when detected; smooth to avoid teleportation."""
+        now = t if t is not None else time.time()
+        was_active = self.is_active
+
         self.x = center_x
         self.y = center_y
         self.is_active = True
-        self.last_seen_time = time.time()
-    
+        self.last_seen_time = now
+
+        # If this is the first-ever sample, or we have no display pos yet, snap once.
+        if self.display_x is None or self.display_y is None:
+            self.display_x = center_x
+            self.display_y = center_y
+            # Re-init filters from this starting point
+            self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_x, init_time=now)
+            self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_y, init_time=now)
+            return
+
+        # If we just re-acquired the hand after a timeout, start smoothing from last drawn pos
+        if not was_active:
+            self._filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_x, init_time=now)
+            self._filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.3, d_cutoff=1.0, initval=self.display_y, init_time=now)
+
+        # Smoothly chase the new measured position
+        self.display_x = self._filter_x.apply(center_x, now)
+        self.display_y = self._filter_y.apply(center_y, now)
+
     def check_timeout(self):
         """Check if hand should disappear due to timeout"""
         if self.is_active and (time.time() - self.last_seen_time) > self.timeout:
             self.is_active = False
-    
+            # Keep display_x/display_y so we can smoothly continue when re-appearing
+
     def draw(self, frame):
-        """Draw the hand circle"""
-        if self.is_active and self.x is not None and self.y is not None:
-            # Draw semi-transparent filled circle
+        """Draw the hand circle (smoothed position)"""
+        if self.is_active and self.display_x is not None and self.display_y is not None:
             overlay = frame.copy()
-            cv2.circle(overlay, (int(self.x), int(self.y)), self.radius, (0, 255, 0), -1)
+            cv2.circle(overlay, (int(self.display_x), int(self.display_y)), self.radius, (0, 255, 0), -1)
             cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
-            
-            # Draw outline
-            cv2.circle(frame, (int(self.x), int(self.y)), self.radius, (0, 255, 0), 3)
-            
-            # Draw center point
-            cv2.circle(frame, (int(self.x), int(self.y)), 5, (255, 0, 0), -1)
-    
+            cv2.circle(frame, (int(self.display_x), int(self.display_y)), self.radius, (0, 255, 0), 3)
+            cv2.circle(frame, (int(self.display_x), int(self.display_y)), 5, (255, 0, 0), -1)
+
     def check_collision(self, ball):
-        """Check if hand collides with ball"""
-        if not self.is_active or self.x is None or self.y is None:
+        """Check if hand collides with ball (use smoothed/drawn position)"""
+        if not self.is_active or self.display_x is None or self.display_y is None:
             return False
-        
-        dx = self.x - ball.x
-        dy = self.y - ball.y
+        dx = self.display_x - ball.x
+        dy = self.display_y - ball.y
         distance = np.sqrt(dx**2 + dy**2)
         return distance < (self.radius + ball.radius)
-    
+
     def to_dict(self):
+        # Share the smoothed/drawn position over the network
         return {
-            'x': self.x,
-            'y': self.y,
+            'x': self.display_x,
+            'y': self.display_y,
             'is_active': self.is_active
         }
-    
+
     def from_dict(self, data):
+        # For peer hands, use the position as-is without additional smoothing here
         if data:
-            self.x = data.get('x')
-            self.y = data.get('y')
+            self.display_x = data.get('x')
+            self.display_y = data.get('y')
+            self.x = self.display_x
+            self.y = self.display_y
             self.is_active = data.get('is_active', False)
             if self.is_active:
                 self.last_seen_time = time.time()
@@ -580,12 +658,14 @@ def main():
                         canvas_x = cam_width + hand_center_x
                     
                     my_hand.update(canvas_x, hand_center_y)
-                    hand_positions.append((canvas_x, hand_center_y))
+                    # Append smoothed position for velocity calc
+                    if my_hand.display_x is not None and my_hand.display_y is not None:
+                        hand_positions.append((my_hand.display_x, my_hand.display_y))
         
         # Check hand timeout
         my_hand.check_timeout()
         
-        # Calculate hand velocity
+        # Calculate hand velocity (based on smoothed positions)
         hand_vx, hand_vy = 0, 0
         if len(hand_positions) >= 2:
             hand_vx = (hand_positions[-1][0] - hand_positions[0][0]) / len(hand_positions)
