@@ -149,6 +149,7 @@ class NetworkManager:
         
         self.received_data = None
         self.last_receive_time = 0
+        self.authority_transfer_pending = False
         
         self.running = True
         self.receive_thread = None
@@ -319,14 +320,15 @@ class NetworkManager:
                 self.connected = False
                 break
     
-    def send_game_state(self, ball, hand, score):
+    def send_game_state(self, ball, hand, score, has_authority):
         """Send complete game state to peer"""
         if self.connected:
             self._send_message({
                 'type': 'game_state',
                 'ball': ball.to_dict(),
                 'hand': hand.to_dict(),
-                'score': score
+                'score': score,
+                'has_authority': has_authority
             })
     
     def get_received_data(self):
@@ -442,8 +444,8 @@ def main():
     # Floor settings
     floor_height = 100
     
-    # Initialize ball (shared position in full display space)
-    ball = Ball(display_width // 2, display_height // 2)
+    # Initialize ball (start on left side)
+    ball = Ball(cam_width // 2, display_height // 2)
     
     # Initialize hands
     my_hand = Hand(radius=50)
@@ -453,13 +455,13 @@ def main():
     
     hand_positions = deque(maxlen=5)
     
-    # Server is authoritative over ball physics
-    is_ball_authority = is_host
+    # Start with left player having authority
+    is_ball_authority = is_left_player
+    last_ball_side = 'left'  # Track which side ball is on
     
     print("\n=== MULTIPLAYER HAND BALL GAME (SPLIT SCREEN) ===")
     print(f"You are: {'LEFT' if is_left_player else 'RIGHT'} player")
     print(f"Mode: {'SERVER' if is_host else 'CLIENT'}")
-    print(f"Ball authority: {'YES' if is_ball_authority else 'NO'}")
     print("Hit the ball to the opponent's side!")
     print("Press 'q' to quit")
     
@@ -530,15 +532,36 @@ def main():
             if 'hand' in peer_data:
                 peer_hand.from_dict(peer_data['hand'])
             
-            # If not ball authority, update ball from peer
-            if not is_ball_authority and 'ball' in peer_data:
+            # Check if peer has authority
+            peer_has_authority = peer_data.get('has_authority', False)
+            
+            # If peer has authority, update ball from peer
+            if peer_has_authority and 'ball' in peer_data:
                 ball.from_dict(peer_data['ball'])
             
             # Sync score
             if 'score' in peer_data:
                 score = peer_data['score']
         
-        # Only update ball physics if this player is the authority
+        # Determine which side the ball is on
+        if ball.x < cam_width:
+            current_ball_side = 'left'
+        else:
+            current_ball_side = 'right'
+        
+        # Transfer authority if ball changed sides
+        if current_ball_side != last_ball_side:
+            last_ball_side = current_ball_side
+            # Authority transfers to player on ball's side
+            if (current_ball_side == 'left' and is_left_player) or \
+               (current_ball_side == 'right' and not is_left_player):
+                is_ball_authority = True
+                print(f"Authority transferred to you (ball on {current_ball_side} side)")
+            else:
+                is_ball_authority = False
+                print(f"Authority transferred to peer (ball on {current_ball_side} side)")
+        
+        # Only update ball physics if this player has authority
         if is_ball_authority:
             # Check collision with my hand
             if my_hand.check_collision(ball):
@@ -581,26 +604,35 @@ def main():
             ball.update(display_width, display_height, floor_height)
             
             # Check scoring (ball touches opponent's edge)
+            scored = False
             if ball.x - ball.radius <= 0:
                 # Ball touched left edge - right player scores
                 score['right'] += 1
-                ball.x = display_width // 2
+                # Spawn on left side (loser's side)
+                ball.x = cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0
                 ball.vy = 0
-                print("Right player scores!")
+                last_ball_side = 'left'
+                is_ball_authority = is_left_player
+                scored = True
+                print("Right player scores! Ball spawns on left side.")
             elif ball.x + ball.radius >= display_width:
                 # Ball touched right edge - left player scores
                 score['left'] += 1
-                ball.x = display_width // 2
+                # Spawn on right side (loser's side)
+                ball.x = cam_width + cam_width // 2
                 ball.y = display_height // 2
                 ball.vx = 0
                 ball.vy = 0
-                print("Left player scores!")
+                last_ball_side = 'right'
+                is_ball_authority = not is_left_player
+                scored = True
+                print("Left player scores! Ball spawns on right side.")
         
-        # Send game state to peer (always send current state)
+        # Send game state to peer
         if network.connected:
-            network.send_game_state(ball, my_hand, score)
+            network.send_game_state(ball, my_hand, score, is_ball_authority)
         
         # Draw ball
         ball.draw(canvas)
@@ -613,7 +645,8 @@ def main():
         
         # Draw UI
         mode_text = "SERVER" if is_host else "CLIENT"
-        status_text = f"{mode_text} - {'CONNECTED' if network.connected else 'WAITING...'}"
+        authority_indicator = " [BALL CONTROL]" if is_ball_authority else ""
+        status_text = f"{mode_text}{authority_indicator} - {'CONNECTED' if network.connected else 'WAITING...'}"
         status_color = (0, 255, 0) if network.connected else (0, 165, 255)
         cv2.putText(canvas, status_text, (10, display_height - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
