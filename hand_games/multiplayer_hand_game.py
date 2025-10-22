@@ -467,19 +467,21 @@ def main():
     # Host-side anomaly and authority management
     last_interaction_time = time.time()
     authority_timeout = 15.0  # seconds
-    client_timeout = 0.35     # seconds without client updates -> revoke
+    client_timeout = 0.8      # seconds without client updates -> revoke (increased)
     max_jump_per_frame = 250  # px jump in 1 frame -> revoke
     pos_margin = 100          # px allowed beyond bounds before revoke
 
     # Hysteresis to avoid flapping
     hysteresis_margin = 40        # px margin inside a half before switching
-    switch_dwell_time = 0.20      # seconds the ball must dwell on a half before switching
+    switch_dwell_time = 0.25      # seconds the ball must dwell on a half before switching
     authority_cooldown = 0.50     # seconds after a switch before another switch allowed
     last_authority_change_time = time.time()
-    side_enter_time = time.time() # when the ball entered current half band
+    # Track which side is currently "desired" based on hysteresis and since when
+    desired_side = None           # 'host' | 'client' | None
+    desired_since = time.time()
 
     # Track last time host received a client ball update (for timeout)
-    last_client_ball_rx_time = 0.0
+    last_client_ball_rx_time = time.time()
 
     def is_on_client_side(x):
         # Host perspective: which half belongs to the client
@@ -503,10 +505,6 @@ def main():
 
     def is_in_center_band(x):
         return (cam_width - hysteresis_margin) < x < (cam_width + hysteresis_margin)
-
-    def is_on_my_side(x):
-        # Local perspective: is the ball on my half (no hysteresis, just gating)
-        return x < cam_width if is_left_player else x >= cam_width
 
     def ball_state_is_valid(candidate, prev_x, prev_y):
         try:
@@ -658,7 +656,7 @@ def main():
                 last_authority_change_time = now
                 print("Authority revoked due to client timeout")
 
-            # If client owns but ball is not on client side (with margin), revoke
+            # If client owns but ball is not on client side (with margin) and not center band, revoke
             if authority_owner == 'client' and not is_on_client_side_with_margin(ball.x) and not is_in_center_band(ball.x):
                 authority_owner = 'host'
                 authority_reset_to_send = True
@@ -670,30 +668,24 @@ def main():
                 print("Authority revoked due to side mismatch")
 
             # Natural ownership switch by half with hysteresis/dwell/cooldown (no reset)
-            desired_owner = None
+            new_desired = None
             if is_on_client_side_with_margin(ball.x):
-                desired_owner = 'client'
+                new_desired = 'client'
             elif is_on_host_side_with_margin(ball.x):
-                desired_owner = 'host'
-            else:
-                desired_owner = None  # center band: no switch
-
-            if desired_owner is not None:
-                # track dwell inside this desired half
-                # reset dwell timer if entering a new desired half
-                if desired_owner != authority_owner:
-                    # If desired is different than current owner, ensure dwell and cooldown
-                    if is_on_client_side_with_margin(ball.x) or is_on_host_side_with_margin(ball.x):
-                        # Initialize/refresh side_enter_time the first time we see this desired half
-                        side_enter_time = side_enter_time if 'last_desired_owner' in locals() and last_desired_owner == desired_owner else now
-                        last_desired_owner = desired_owner
-                        if (now - last_authority_change_time) >= authority_cooldown and (now - side_enter_time) >= switch_dwell_time:
-                            authority_owner = desired_owner
-                            last_authority_change_time = now
-                            print(f"Authority changed to {authority_owner} (hysteresis)")
-                else:
-                    # Already matches, keep tracking
-                    last_desired_owner = desired_owner
+                new_desired = 'host'
+            # Update desired side tracking
+            if new_desired != desired_side:
+                desired_side = new_desired
+                desired_since = now
+            # Perform switch if stable and cooled down
+            if desired_side is not None and desired_side != authority_owner:
+                if (now - last_authority_change_time) >= authority_cooldown and (now - desired_since) >= switch_dwell_time:
+                    authority_owner = desired_side
+                    last_authority_change_time = now
+                    if authority_owner == 'client':
+                        # Give client time to start sending before timeout triggers
+                        last_client_ball_rx_time = now
+                    print(f"Authority changed to {authority_owner} (hysteresis)")
 
             # Host-controlled idle timeout respawn
             time_since_interaction = now - last_interaction_time
@@ -709,9 +701,9 @@ def main():
                 last_authority_change_time = now
                 print("HOST TIMEOUT RESET - Ball respawned")
 
-        # Local control: authority AND ball must be on my side to simulate (prevents desync feeling)
+        # Local control: simulate whenever you have authority (no side gating)
         local_has_control = (authority_owner == ('host' if is_host else 'client'))
-        simulate_locally = local_has_control and is_on_my_side(ball.x)
+        simulate_locally = local_has_control
 
         # Physics simulation only on the side with local control
         if simulate_locally:
@@ -755,7 +747,6 @@ def main():
                 ball.y = display_height // 2
                 ball.vx = 0; ball.vy = 0
                 prev_ball_x, prev_ball_y = ball.x, ball.y
-                # Authority by respawn side
                 authority_owner = 'host' if is_left_player else 'client'
                 authority_reset_to_send = True
                 last_interaction_time = time.time()
