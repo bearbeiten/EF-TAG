@@ -19,6 +19,7 @@ class Ball:
         self.gravity = 0.5
         self.damping = 0.98
         self.bounce_damping = 0.7
+        self.center_line = None  # Will be set to cam_width for reference
     
     def update(self, width, height, floor_height=100):
         # Apply gravity
@@ -32,13 +33,14 @@ class Ball:
         self.x += self.vx
         self.y += self.vy
         
-        # Wall collisions (both sides)
+        # Wall collisions - only bounce at outer edges (0 and width)
+        # Allow free passage through center line
         if self.x - self.radius < 0:
             self.x = self.radius
-            self.vx = -self.vx * self.bounce_damping
+            self.vx = abs(self.vx) * self.bounce_damping  # Bounce right
         elif self.x + self.radius > width:
             self.x = width - self.radius
-            self.vx = -self.vx * self.bounce_damping
+            self.vx = -abs(self.vx) * self.bounce_damping  # Bounce left
         
         # Top wall
         if self.y - self.radius < 0:
@@ -320,10 +322,10 @@ class NetworkManager:
                 self.connected = False
                 break
     
-    def send_game_state(self, ball, hand, score, has_authority, is_host, authority_reset=False):
+    def send_game_state(self, ball, hand, score, has_authority, is_host, authority_reset=False, display_width=None):
         """Send complete game state to peer"""
         if self.connected:
-            self._send_message({
+            message = {
                 'type': 'game_state',
                 'ball': ball.to_dict(),
                 'hand': hand.to_dict(),
@@ -331,7 +333,10 @@ class NetworkManager:
                 'has_authority': has_authority,
                 'is_host': is_host,
                 'authority_reset': authority_reset
-            })
+            }
+            if display_width is not None:
+                message['display_width'] = display_width
+            self._send_message(message)
     
     def get_received_data(self):
         """Get received game state"""
@@ -448,6 +453,7 @@ def main():
     
     # Initialize ball (start on left side)
     ball = Ball(cam_width // 2, display_height // 2)
+    ball.center_line = cam_width  # Set center line reference
     
     # Initialize hands
     my_hand = Hand(radius=50)
@@ -545,11 +551,13 @@ def main():
             if 'hand' in peer_data:
                 peer_hand.from_dict(peer_data['hand'])
             
-            # Always trust host for score and ball state
+            # If we receive data from the host, trust their ball state and score
             if peer_data.get('is_host', False):
                 if 'score' in peer_data:
                     score = peer_data['score']
                 if 'ball' in peer_data:
+                    # Host sends ball in full double-width coordinate system
+                    # We just use it directly since we render to the same double-width canvas
                     ball.from_dict(peer_data['ball'])
                     prev_ball_x = ball.x
                     last_interaction_time = time.time()
@@ -646,7 +654,7 @@ def main():
         # Send game state to peer (host authoritative)
         if network.connected:
             # has_authority = True for host, False for client
-            network.send_game_state(ball, my_hand, score, is_host, is_host, False)
+            network.send_game_state(ball, my_hand, score, is_host, is_host, False, display_width)
         
         # Draw ball
         ball.draw(canvas)
